@@ -1,0 +1,13 @@
+version: '3.8'
+services:
+  agent-svc:
+    build: .
+    environment:
+      - HTTP_PORT=8080
+      - REGISTRY_SERVER=${REGISTRY_SERVER}
+      - REGISTRY_USERNAME=${REGISTRY_USERNAME}
+      - REGISTRY_PASSWORD=${REGISTRY_PASSWORD}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "8080:8080"

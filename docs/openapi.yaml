@@ -1,0 +1,26 @@
+openapi: 3.0.0
+info:
+  title: Agent Service API
+  version: 0.1.0
+paths:
+  /agents:
+    post:
+      summary: Create agent
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAgentRequest'
+      responses:
+        '201':
+          description: Created
+
+components:
+  schemas:
+    CreateAgentRequest:
+      type: object
+      properties:
+        image:
+          type: string
+        env:
+          type: object

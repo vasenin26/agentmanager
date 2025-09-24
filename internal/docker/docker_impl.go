@@ -2,45 +2,119 @@ package docker
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
-	"sync"
+	"io"
+	"time"
+
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/registry"
+	"github.com/docker/docker/client"
 )
 
-type fakeDocker struct {
-	mu sync.Mutex
-	containers map[string]ContainerInspect
+type dockerClient struct {
+	cli *client.Client
 }
 
-func NewFake() DockerClient {
-	return &fakeDocker{containers: map[string]ContainerInspect{}}
+// New возвращает реализацию DockerClient поверх Docker Engine API.
+func New() DockerClient {
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		panic(fmt.Errorf("failed to init docker client: %w", err))
+	}
+	return &dockerClient{cli: cli}
 }
 
-func (f *fakeDocker) PullImage(ctx context.Context, image string, auth AuthConfig) error { return nil }
-func (f *fakeDocker) CreateContainer(ctx context.Context, cfg ContainerConfig) (string, error) {
-	f.mu.Lock(); defer f.mu.Unlock()
-	id := fmt.Sprintf("fake-%d", len(f.containers)+1)
-	f.containers[id] = ContainerInspect{ID: id, Image: cfg.Image, State: "created", CreatedAt: "now"}
-	return id, nil
-}
-func (f *fakeDocker) StartContainer(ctx context.Context, id string) error {
-	f.mu.Lock(); defer f.mu.Unlock()
-	c, ok := f.containers[id]
-	if !ok { return fmt.Errorf("container not found") }
-	c.State = "running"
-	f.containers[id] = c
+func (d *dockerClient) PullImage(ctx context.Context, image string, auth AuthConfig) error {
+	var authStr string
+	if auth.Server != "" || auth.Username != "" || auth.Password != "" {
+		ac := registry.AuthConfig{ServerAddress: auth.Server, Username: auth.Username, Password: auth.Password}
+		b, err := json.Marshal(ac)
+		if err != nil {
+			return fmt.Errorf("marshal auth: %w", err)
+		}
+		authStr = base64.URLEncoding.EncodeToString(b)
+	}
+
+	rc, err := d.cli.ImagePull(ctx, image, types.ImagePullOptions{RegistryAuth: authStr})
+	if err != nil {
+		return fmt.Errorf("image pull: %w", err)
+	}
+	defer rc.Close()
+	// прочитаем поток до конца, чтобы Docker завершил операцию
+	_, _ = io.Copy(io.Discard, rc)
 	return nil
 }
-func (f *fakeDocker) StopContainer(ctx context.Context, id string) error {
-	f.mu.Lock(); defer f.mu.Unlock()
-	c, ok := f.containers[id]
-	if !ok { return fmt.Errorf("container not found") }
-	c.State = "exited"
-	f.containers[id] = c
+
+func (d *dockerClient) CreateContainer(ctx context.Context, cfg ContainerConfig) (string, error) {
+	env := make([]string, 0, len(cfg.Env))
+	for k, v := range cfg.Env {
+		env = append(env, fmt.Sprintf("%s=%s", k, v))
+	}
+
+	contCfg := &container.Config{
+		Image: cfg.Image,
+		Env:   env,
+	}
+
+	resp, err := d.cli.ContainerCreate(ctx, contCfg, &container.HostConfig{}, nil, nil, "")
+	if err != nil {
+		return "", fmt.Errorf("container create: %w", err)
+	}
+
+	if err := d.cli.ContainerStart(ctx, resp.ID, types.ContainerStartOptions{}); err != nil {
+		return "", fmt.Errorf("container start: %w", err)
+	}
+
+	return resp.ID, nil
+}
+
+func (d *dockerClient) StartContainer(ctx context.Context, id string) error {
+	inspect, err := d.cli.ContainerInspect(ctx, id)
+	if err != nil {
+		return fmt.Errorf("inspect before start: %w", err)
+	}
+	if inspect.ContainerJSONBase != nil && inspect.ContainerJSONBase.State != nil && inspect.ContainerJSONBase.State.Running {
+		return nil
+	}
+	if err := d.cli.ContainerStart(ctx, id, types.ContainerStartOptions{}); err != nil {
+		return fmt.Errorf("container start: %w", err)
+	}
 	return nil
 }
-func (f *fakeDocker) InspectContainer(ctx context.Context, id string) (ContainerInspect, error) {
-	f.mu.Lock(); defer f.mu.Unlock()
-	c, ok := f.containers[id]
-	if !ok { return ContainerInspect{}, fmt.Errorf("container not found") }
-	return c, nil
+
+func (d *dockerClient) StopContainer(ctx context.Context, id string) error {
+	inspect, err := d.cli.ContainerInspect(ctx, id)
+	if err != nil {
+		return fmt.Errorf("inspect before stop: %w", err)
+	}
+	running := inspect.ContainerJSONBase != nil && inspect.ContainerJSONBase.State != nil && inspect.ContainerJSONBase.State.Running
+	if !running {
+		return nil
+	}
+
+	timeout := 10 * time.Second
+	if err := d.cli.ContainerStop(ctx, id, &timeout); err != nil {
+		return fmt.Errorf("container stop: %w", err)
+	}
+	return nil
+}
+
+func (d *dockerClient) InspectContainer(ctx context.Context, id string) (ContainerInspect, error) {
+	inspect, err := d.cli.ContainerInspect(ctx, id)
+	if err != nil {
+		return ContainerInspect{}, fmt.Errorf("container inspect: %w", err)
+	}
+	state := ""
+	if inspect.ContainerJSONBase != nil && inspect.ContainerJSONBase.State != nil {
+		state = inspect.ContainerJSONBase.State.Status
+	}
+	image := ""
+	if inspect.Config != nil {
+		image = inspect.Config.Image
+	}
+	created := inspect.Created
+	return ContainerInspect{ID: inspect.ID, Image: image, State: state, CreatedAt: created}, nil
 }

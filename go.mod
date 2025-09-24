@@ -7,4 +7,5 @@ require (
 	github.com/docker/docker v20.10.17+incompatible
 	go.uber.org/zap v1.24.0
 	github.com/prometheus/client_golang v1.14.0
+	github.com/stretchr/testify v1.8.4
 )

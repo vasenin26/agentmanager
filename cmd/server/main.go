@@ -21,8 +21,8 @@ func main() {
 
 	metrics.Register()
 
-	// в MVP используется fake-реализация DockerClient
-	dc := docker.NewFake()
+	// используется дефолтная реализация DockerClient (реальный Docker)
+	dc := docker.New()
 	st := store.NewMemoryStore()
 
 	reg := docker.AuthConfig{Server: cfg.RegistryServer, Username: cfg.RegistryUsername, Password: cfg.RegistryPassword}

@@ -4,7 +4,7 @@ services:
     build: .
     environment:
       - HTTP_PORT=8080
-      - REGISTRY_SERVER=${REGISTRY_SERVER}
+      - REGISTRY_SERVER=${REGISTRY_SERVER:-ghcr.io}
       - REGISTRY_USERNAME=${REGISTRY_USERNAME}
       - REGISTRY_PASSWORD=${REGISTRY_PASSWORD}
     volumes:

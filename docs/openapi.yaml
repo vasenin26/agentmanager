@@ -14,6 +14,47 @@ paths:
       responses:
         '201':
           description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentInfo'
+    get:
+      summary: List running agents
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AgentInfo'
+  /agents/{id}/stop:
+    post:
+      summary: Stop agent
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentInfo'
+  /metrics:
+    get:
+      summary: Prometheus metrics endpoint
+      responses:
+        '200':
+          description: Prometheus metrics
+          content:
+            text/plain:
+              schema:
+                type: string
 
 components:
   schemas:
@@ -24,3 +65,27 @@ components:
           type: string
         env:
           type: object
+          additionalProperties:
+            type: string
+      required:
+        - image
+    AgentInfo:
+      type: object
+      properties:
+        id:
+          type: string
+        image:
+          type: string
+        status:
+          $ref: '#/components/schemas/AgentStatus'
+        createdAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - image
+        - status
+        - createdAt
+    AgentStatus:
+      type: string
+      enum: [running, stopped, created]

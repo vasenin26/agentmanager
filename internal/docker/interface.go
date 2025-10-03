@@ -26,4 +26,7 @@ type DockerClient interface {
 	StartContainer(ctx context.Context, id string) error
 	StopContainer(ctx context.Context, id string) error
 	InspectContainer(ctx context.Context, id string) (ContainerInspect, error)
+    // StreamContainerLogs streams stdout/stderr logs. If follow is true, it tails.
+    StreamContainerLogs(ctx context.Context, id string, follow bool) error
+	Close() error
 }

@@ -9,9 +9,15 @@ import (
 
 func NewRouter(h *Handlers) http.Handler {
 	r := chi.NewRouter()
-	r.Post("/agents", h.CreateAgent)
-	r.Get("/agents", h.ListAgents)
-	r.Post("/agents/{id}/stop", h.StopAgent)
+	
+	// Orchestrator interface endpoints
+	r.Post("/orchestrator/start-agent", h.StartAgent)
+	r.Post("/orchestrator/stop-agent/{agentId}", h.StopAgent)
+	r.Post("/orchestrator/start-process", h.StartProcess)
+	
+	// SSH key management
+	r.Get("/ssh/keys/{agentId}", h.GetSSHKey)
+	
 	r.Handle("/metrics", promhttp.Handler())
 	return r
 }

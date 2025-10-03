@@ -5,13 +5,14 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/yourorg/agent-svc/internal/api"
-	"github.com/yourorg/agent-svc/internal/config"
-	"github.com/yourorg/agent-svc/internal/docker"
-	"github.com/yourorg/agent-svc/internal/logger"
-	"github.com/yourorg/agent-svc/internal/metrics"
-	"github.com/yourorg/agent-svc/internal/service"
-	"github.com/yourorg/agent-svc/internal/store"
+	"github.com/vasenin26/agentmanager/internal/api"
+	"github.com/vasenin26/agentmanager/internal/config"
+	"github.com/vasenin26/agentmanager/internal/docker"
+	"github.com/vasenin26/agentmanager/internal/logger"
+	"github.com/vasenin26/agentmanager/internal/metrics"
+	"github.com/vasenin26/agentmanager/internal/service"
+	"github.com/vasenin26/agentmanager/internal/ssh"
+	"go.uber.org/zap"
 )
 
 func main() {
@@ -21,12 +22,27 @@ func main() {
 
 	metrics.Register()
 
-	// в MVP используется fake-реализация DockerClient
-	dc := docker.NewFake()
-	st := store.NewMemoryStore()
+	// Создаем реальную реализацию DockerClient
+	dc, err := docker.New(l)
+	if err != nil {
+		l.Fatal("Failed to create docker client", zap.Error(err))
+	}
+	defer func() {
+		if err := dc.Close(); err != nil {
+			l.Error("Failed to close docker client", zap.Error(err))
+		}
+	}()
+	
+	// Create SSH storage
+	sshStorage, err := ssh.NewStorage(cfg.SSHKeysDir)
+	if err != nil {
+		l.Fatal("Failed to create SSH storage", zap.Error(err))
+	}
 
 	reg := docker.AuthConfig{Server: cfg.RegistryServer, Username: cfg.RegistryUsername, Password: cfg.RegistryPassword}
-	svc := service.NewAgentService(dc, st, reg, cfg.DefaultTimeout)
+	serverURL := fmt.Sprintf("http://localhost:%s", cfg.HTTPPort)
+	svc := service.NewAgentService(dc, reg, cfg.DefaultTimeout, serverURL, sshStorage,
+		cfg.APIHost, cfg.OpenAIModel, cfg.OpenAIAPIKey, cfg.GitUserName, cfg.GitUserEmail)
 	h := api.NewHandlers(svc)
 	router := api.NewRouter(h)
 

@@ -5,6 +5,10 @@ build:
 run:
 	go run ./cmd/server/main.go
 
+run-image:
+	docker compose build
+	docker compose up -d
+
 .PHONY: bump-patch
 bump-patch:
 	$(eval LATEST_TAG := $(shell git describe --tags --abbrev=0))

@@ -26,6 +26,16 @@ type AgentService struct {
 	gitUserEmail string
 }
 
+type AgentModuleEnv struct {
+	API_HOST        string
+	AGENT_TOKEN     string
+	OPENAI_MODEL    string
+	OPENAI_API_KEY  string
+	GIT_USER_NAME   string
+	GIT_USER_EMAIL  string
+	SSH_PRIVATE_KEY string
+}
+
 // Ensure AgentService implements AgentOrchestratorInterface
 var _ interfaces.AgentOrchestratorInterface = (*AgentService)(nil)
 
@@ -75,7 +85,6 @@ func (as *AgentService) StartAgent(configOptions models.ConfigOptions) models.Ag
 		Env: map[string]string{
 			"AGENT_ID":        configOptions.AgentID.String(),
 			"API_TOKEN":       configOptions.Token,
-			"SERVER":          as.serverURL,
 			"SSH_PRIVATE_KEY": sshKeyPair.PrivateKey,
 			"API_HOST":        as.apiHost,
 			"OPENAI_MODEL":    as.openaiModel,

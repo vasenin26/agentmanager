@@ -107,6 +107,120 @@ SSH ключи сохраняются в файловой системе:
 - Go 1.20+
 - Доступ к Docker API (по умолчанию через Docker socket)
 
+## Подготовка сервера для деплоя (prod)
+
+1. Установить Docker и Docker Compose
+   ```bash
+   sudo apt update && sudo apt install -y ca-certificates curl gnupg
+   sudo install -m 0755 -d /etc/apt/keyrings
+   curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+   echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+   sudo apt update
+   sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+   sudo usermod -aG docker $USER
+   newgrp docker
+   ```
+
+2. Подготовить директорию деплоя и файлы
+   ```bash
+   sudo mkdir -p /opt/agentmanager
+   sudo chown -R $USER:$USER /opt/agentmanager
+   # Примечание: workflow CI/CD может сам загрузить docker-compose.prod.yaml и создать .env во время деплоя
+   ```
+
+3. Настроить доступ к GHCR (если образ приватный)
+   ```bash
+   docker login ghcr.io
+   # введите GitHub username и PAT с правами read:packages
+   ```
+
+4. Запуск/обновление приложения
+   ```bash
+   cd /opt/agentmanager
+   docker compose -f docker-compose.prod.yaml --env-file .env pull
+   docker compose -f docker-compose.prod.yaml --env-file .env up -d
+   ```
+
+5. (Опционально) Автозапуск через systemd
+   ```bash
+   sudo tee /etc/systemd/system/agentmanager.service >/dev/null <<'EOF'
+   [Unit]
+   Description=agentmanager via Docker Compose
+   Requires=docker.service
+   After=docker.service
+
+   [Service]
+   Type=oneshot
+   WorkingDirectory=/opt/agentmanager
+   ExecStart=/usr/bin/docker compose -f docker-compose.prod.yaml --env-file .env up -d
+   ExecStop=/usr/bin/docker compose -f docker-compose.prod.yaml --env-file .env down
+   RemainAfterExit=yes
+   TimeoutStartSec=0
+
+   [Install]
+   WantedBy=multi-user.target
+   EOF
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now agentmanager
+   ```
+
+### Пример .env (prod)
+```bash
+# HTTP
+HTTP_PORT=8080
+
+# Docker/Registry (для внутренней работы сервиса)
+REGISTRY_SERVER=ghcr.io
+REGISTRY_USERNAME=
+REGISTRY_PASSWORD=
+
+# Agent config (по необходимости)
+API_HOST=
+OPENAI_MODEL=
+OPENAI_API_KEY=
+GIT_USER_NAME=
+GIT_USER_EMAIL=
+
+# SSH keys внутри контейнера (используется named volume)
+SSH_KEYS_DIR=/app/keys
+
+# Тег образа, деплой по релизным тегам
+IMAGE_TAG=latest
+```
+
+## CI/CD: Автодеплой из GitHub Actions
+
+Деплой запускается автоматически при пуше тега формата `vX.X.X` (например, `v1.2.3`). Workflow:
+
+- Собирает образ из `Dockerfile`
+- Пушит образы в GHCR: `latest`, `SHA`, и версионный тег (`v1.2.3`)
+- По SSH заходит на сервер, готовит директорию, загружает `docker-compose.prod.yaml`, создаёт/обновляет `.env`
+- Устанавливает `IMAGE_TAG` из тега релиза и выполняет `docker compose pull && up -d`
+
+Требуемые Secrets (Repository → Settings → Secrets and variables → Actions):
+
+- `SSH_HOST` — адрес сервера
+- `SSH_USER` — пользователь
+- `SSH_KEY` — приватный SSH ключ (PEM)
+- `SSH_PORT` — порт (опционально, по умолчанию 22)
+- `REMOTE_DIR` — путь деплоя (например, `/opt/agentmanager`)
+- `ENV_FILE_CONTENTS` — содержимое `.env` (опционально; если задано, будет записано при деплое)
+- `GHCR_USERNAME`, `GHCR_TOKEN` — нужны, если образ приватный (pull на сервере)
+
+Выпуск релиза:
+
+```bash
+git tag v1.2.3
+git push origin v1.2.3
+```
+
+Проверка статуса на сервере:
+
+```bash
+docker compose -f /opt/agentmanager/docker-compose.prod.yaml --env-file /opt/agentmanager/.env ps
+curl -fsSL http://localhost:8080/metrics | head
+```
+
 ## Конфигурация
 
 ### Переменные окружения

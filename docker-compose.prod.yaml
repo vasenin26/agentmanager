@@ -1,0 +1,47 @@
+version: '3.8'
+services:
+  agent-svc:
+    image: ghcr.io/vasenin26/agentmanager:${IMAGE_TAG:-latest}
+    pull_policy: always
+    env_file:
+      - .env
+    environment:
+      - HTTP_PORT=${HTTP_PORT:-8080}
+      - DOCKER_HOST=${DOCKER_HOST}
+      - REGISTRY_SERVER=${REGISTRY_SERVER}
+      - REGISTRY_USERNAME=${REGISTRY_USERNAME}
+      - REGISTRY_PASSWORD=${REGISTRY_PASSWORD}
+      - SSH_KEYS_DIR=/app/keys
+      - API_HOST=${API_HOST}
+      - OPENAI_MODEL=${OPENAI_MODEL}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - GIT_USER_NAME=${GIT_USER_NAME}
+      - GIT_USER_EMAIL=${GIT_USER_EMAIL}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ssh_keys:/app/keys
+    ports:
+      - "${HTTP_PORT:-8080}:8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/metrics"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          memory: 128M
+
+volumes:
+  ssh_keys:
+
+

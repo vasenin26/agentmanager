@@ -20,19 +20,20 @@ func main() {
 	l, _ := logger.New()
 	defer l.Sync()
 
-	metrics.Register()
-
 	// Создаем реальную реализацию DockerClient
 	dc, err := docker.New(l)
 	if err != nil {
 		l.Fatal("Failed to create docker client", zap.Error(err))
 	}
+
+	// Регистрируем метрики с Docker клиентом
+	metrics.RegisterWithDockerClient(dc)
 	defer func() {
 		if err := dc.Close(); err != nil {
 			l.Error("Failed to close docker client", zap.Error(err))
 		}
 	}()
-	
+
 	// Create SSH storage
 	sshStorage, err := ssh.NewStorage(cfg.SSHKeysDir)
 	if err != nil {

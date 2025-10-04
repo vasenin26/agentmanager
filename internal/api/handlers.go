@@ -5,15 +5,16 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/vasenin26/agentmanager/internal/models"
 	"github.com/vasenin26/agentmanager/internal/interfaces"
+	"github.com/vasenin26/agentmanager/internal/metrics"
+	"github.com/vasenin26/agentmanager/internal/models"
 )
 
-type Handlers struct{ 
-	svc interfaces.AgentOrchestratorInterface 
+type Handlers struct {
+	svc interfaces.AgentOrchestratorInterface
 }
-func NewHandlers(s interfaces.AgentOrchestratorInterface) *Handlers { return &Handlers{svc: s} }
 
+func NewHandlers(s interfaces.AgentOrchestratorInterface) *Handlers { return &Handlers{svc: s} }
 
 // StartAgent starts an agent using the orchestrator interface
 func (h *Handlers) StartAgent(w http.ResponseWriter, r *http.Request) {
@@ -22,7 +23,7 @@ func (h *Handlers) StartAgent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid body", http.StatusBadRequest)
 		return
 	}
-	
+
 	agentMeta := h.svc.StartAgent(configOptions)
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(agentMeta)
@@ -35,12 +36,12 @@ func (h *Handlers) StopAgent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "agentId is required", http.StatusBadRequest)
 		return
 	}
-	
+
 	if err := h.svc.StopAgent(agentID); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	
+
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"status": "agent stopped"})
 }
@@ -54,12 +55,15 @@ func (h *Handlers) StartProcess(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid body", http.StatusBadRequest)
 		return
 	}
-	
+
+	// Инкрементируем метрику запуска процессинга
+	metrics.ProcessStartCommands.Inc()
+
 	if err := h.svc.StartProcess(req.TaskType); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	
+
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"status": "process started"})
 }
@@ -71,7 +75,7 @@ func (h *Handlers) GetSSHKey(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "agentId is required", http.StatusBadRequest)
 		return
 	}
-	
+
 	// This would need to be implemented in the service layer
 	// For now, return a placeholder response
 	http.Error(w, "SSH key retrieval not implemented", http.StatusNotImplemented)

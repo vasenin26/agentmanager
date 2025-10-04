@@ -26,16 +26,6 @@ type AgentService struct {
 	gitUserEmail string
 }
 
-type AgentModuleEnv struct {
-	API_HOST        string
-	AGENT_TOKEN     string
-	OPENAI_MODEL    string
-	OPENAI_API_KEY  string
-	GIT_USER_NAME   string
-	GIT_USER_EMAIL  string
-	SSH_PRIVATE_KEY string
-}
-
 // Ensure AgentService implements AgentOrchestratorInterface
 var _ interfaces.AgentOrchestratorInterface = (*AgentService)(nil)
 

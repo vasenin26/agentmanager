@@ -14,8 +14,8 @@ BOLT_DB_PATH=./data/orchestrator.db
 ### External Task API
 
 ```bash
-# URL of the external task API
-TASK_API_URL=https://api.example.com/tasks
+# URL of the external task API (with orchestrator prefix)
+TASK_API_URL=https://api.example.com/api/v1/orchestrator
 
 # Authentication token for the task API
 TASK_API_TOKEN=your-api-token
@@ -34,15 +34,14 @@ TASK_POLL_INTERVAL=5s
 AGENT_MEMORY_LIMIT_MB=512
 ```
 
-### Orchestrator Control
+### Agent Configuration
 
 ```bash
-# Enable or disable the orchestrator
-ORCHESTRATOR_ENABLED=true
-
 # API token for all agents (shared token)
 AGENT_API_TOKEN=your-agent-api-token
 ```
+
+**Note:** The orchestrator is always enabled and requires `TASK_API_URL` to be set.
 
 ## Database Structure
 
@@ -64,11 +63,11 @@ The orchestrator uses bbolt (embedded key-value database) with the following buc
 
 ## External Task API
 
-The orchestrator expects the following API endpoints:
+The orchestrator expects the following API endpoints under the `/api/v1/orchestrator` prefix:
 
-### GET /tasks/next
+### GET /api/v1/orchestrator/tasks/next
 
-Fetch the next available task.
+Fetch the next available task (without reservation).
 
 **Response:**
 - `200 OK` - Task available
@@ -85,14 +84,23 @@ Fetch the next available task.
 }
 ```
 
-### POST /tasks/{taskId}/complete
+### POST /api/v1/orchestrator/tasks/{taskId}/reserve
 
-Mark a task as completed.
+Reserve task with estimated time until agent start.
+
+**Request Body:**
+```json
+{
+  "reserve_seconds": 10  // 10 seconds for tasks without context, 300 for tasks with busy context
+}
+```
 
 **Response:**
-- `200 OK` or `204 No Content` - Success
+- `200 OK` or `204 No Content` - Successfully reserved
+- `409 Conflict` - Task already reserved by another orchestrator
+- `404 Not Found` - Task not found
 
-### PUT /projects/{projectId}/key
+### PUT /api/v1/orchestrator/projects/{projectId}/key
 
 Update project SSH public key. Called when orchestrator generates new keys for a project.
 
@@ -128,36 +136,51 @@ The orchestrator exports the following Prometheus metrics:
 ### Task Processing Flow
 
 1. **Task Polling Loop**
-   - Orchestrator polls `TASK_API_URL/tasks/next` every `TASK_POLL_INTERVAL`
+   - Orchestrator polls `{TASK_API_URL}/tasks/next` every `TASK_POLL_INTERVAL`
+   - Can make multiple sequential requests to fetch multiple tasks at once
    - Checks available memory before fetching tasks
+   - Fetches tasks until memory is full or no more tasks available (204 response)
    - If no memory available, waits for next interval
 
-2. **Task Without Context**
+2. **Task Reservation (Two-Phase)**
+   - Phase 1: Get task via `GET /tasks/next` (informational)
+   - Phase 2: Analyze task and estimate time until agent start
+     - No context needed: 10 seconds
+     - Context needed but free: 10 seconds
+     - Context needed but busy: 300 seconds (5 minutes)
+   - Phase 3: Reserve task via `POST /tasks/{id}/reserve` with `reserve_seconds`
+   - If orchestrator doesn't start agent within `reserve_seconds`, task is released automatically
+
+3. **Task Without Context**
+   - Reserves for 10 seconds
    - Creates agent immediately
    - Starts container without volume mount
    - Passes `TASK_ID` environment variable to agent
 
-3. **Task With Context**
+4. **Task With Context**
    - Gets or creates Docker volume for context
    - If context is available:
+     - Reserves for 10 seconds
      - Occupies context
      - Creates agent with volume mounted at `/repos`
      - Starts container
    - If context is occupied:
+     - Reserves for 300 seconds (estimated queue wait time)
      - Enqueues task in context's local queue
      - Waits for context to be released
 
-4. **Agent Completion**
+5. **Agent Completion**
    - Docker events listener detects container exit
    - If exit code is 0 (success):
      - Releases memory
-     - Marks task as completed in external API
+     - Agent marks task as completed in external API via its own API
      - If context has queued tasks:
        - Starts next task from queue
      - Otherwise:
        - Releases context
    - If exit code is non-zero (failure):
      - Releases memory and context
+     - Agent didn't mark task as completed
      - Task becomes available again in external API after timeout
 
 ### Context Management
@@ -215,6 +238,8 @@ Check:
 - `TASK_API_TOKEN` is valid
 - Available memory: `orchestrator_available_memory_bytes` metric
 - Task API returns tasks
+- Task reservation mechanism is working correctly
+- Each call to `/tasks/next` returns a unique task
 
 ### Context Issues
 

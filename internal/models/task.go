@@ -7,4 +7,7 @@ type TaskDTO struct {
 	Timeout   int     `json:"timeout"`    // Таймаут выполнения в секундах
 	ProjectID string  `json:"project_id"` // ID проекта к которому привязана задача
 	PublicKey *string `json:"public_key"` // Публичный SSH ключ проекта (может быть nil)
+
+	// Локальные поля (не из API, генерируются оркестратором)
+	AgentUUID string `json:"-"` // UUID воркера для резервирования (генерируется локально)
 }

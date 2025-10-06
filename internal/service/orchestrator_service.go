@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,8 +25,8 @@ type OrchestratorService struct {
 	queueService      *QueueService
 	agentStateStorage *storage.AgentStateStorage
 	agentService      *AgentService
-	sshStorage        *ssh.Storage // SSH storage для управления ключами проектов
-	agentAPIToken     string       // Общий токен для всех агентов
+	projectKeyManager *ssh.ProjectKeyManager // Управление SSH ключами проектов
+	agentAPIToken     string                 // Общий токен для всех агентов
 	logger            *zap.Logger
 
 	// Управление жизненным циклом
@@ -43,7 +44,7 @@ func NewOrchestratorService(
 	queueService *QueueService,
 	agentStateStorage *storage.AgentStateStorage,
 	agentService *AgentService,
-	sshStorage *ssh.Storage,
+	projectKeyManager *ssh.ProjectKeyManager,
 	agentAPIToken string,
 	pollInterval time.Duration,
 	logger *zap.Logger,
@@ -56,7 +57,7 @@ func NewOrchestratorService(
 		queueService:      queueService,
 		agentStateStorage: agentStateStorage,
 		agentService:      agentService,
-		sshStorage:        sshStorage,
+		projectKeyManager: projectKeyManager,
 		agentAPIToken:     agentAPIToken,
 		logger:            logger,
 		stopChan:          make(chan struct{}),
@@ -139,6 +140,35 @@ func (os *OrchestratorService) taskPullLoop(ctx context.Context) {
 func (os *OrchestratorService) processTask(ctx context.Context, task *models.TaskDTO) error {
 	os.logger.Info("Processing task", zap.String("taskID", task.ID))
 
+	// Прогнозировать время до запуска агента
+	reserveSeconds := os.estimateTimeUntilStart(ctx, task)
+	os.logger.Info("Estimated time until agent start",
+		zap.String("taskID", task.ID),
+		zap.Int("reserveSeconds", reserveSeconds))
+
+	// Генерировать agent_uuid для воркера
+	agentUUID := uuid.New().String()
+	task.AgentUUID = agentUUID
+
+	// Зарезервировать задачу с указанием срока и UUID воркера
+	if err := os.taskClient.ReserveTask(ctx, task.ID, reserveSeconds, agentUUID); err != nil {
+		// Проверить, не конфликт ли резервирования
+		if strings.Contains(err.Error(), "already reserved") {
+			os.logger.Warn("Task reservation conflict, skipping task",
+				zap.String("taskID", task.ID),
+				zap.String("agentUUID", agentUUID))
+			metrics.TaskReservationConflictsTotal.Inc()
+			// Не критично - пропускаем задачу, получим следующую
+			return nil
+		}
+
+		os.logger.Error("Failed to reserve task",
+			zap.String("taskID", task.ID),
+			zap.String("agentUUID", agentUUID),
+			zap.Error(err))
+		return fmt.Errorf("failed to reserve task: %w", err)
+	}
+
 	// Проверить требуется ли контекст для задачи
 	if task.ContextID == nil {
 		// Контекст не требуется - запустить агента без контекста
@@ -175,26 +205,59 @@ func (os *OrchestratorService) processTask(ctx context.Context, task *models.Tas
 	return os.startAgentForTask(ctx, task, contextDTO)
 }
 
+// estimateTimeUntilStart прогнозирует время до запуска агента
+func (os *OrchestratorService) estimateTimeUntilStart(ctx context.Context, task *models.TaskDTO) int {
+	// Базовое время для подготовки и запуска агента
+	const baseTimeSeconds = 10
+
+	// Если контекст не требуется - быстрый старт
+	if task.ContextID == nil {
+		return baseTimeSeconds
+	}
+
+	// Проверить доступность контекста
+	contextID := *task.ContextID
+	isAvailable, err := os.contextService.IsContextAvailable(ctx, contextID)
+	if err != nil {
+		// Контекст не существует - будет создан, быстрый старт
+		return baseTimeSeconds
+	}
+
+	// Контекст существует, проверить доступность
+	if isAvailable {
+		// Контекст свободен - быстрый старт
+		return baseTimeSeconds
+	}
+
+	// Контекст занят - нужно подождать
+	// В базовой реализации: 300 секунд (5 минут)
+	return 300
+}
+
 // validateAndPrepareProjectKey проверяет и подготавливает SSH ключи для проекта
-func (os *OrchestratorService) validateAndPrepareProjectKey(ctx context.Context, task *models.TaskDTO) (*ssh.ProjectKeyPair, error) {
+// Ключи генерируются ОДИН РАЗ для проекта и используются ВСЕМИ агентами этого проекта
+func (os *OrchestratorService) validateAndPrepareProjectKey(ctx context.Context, task *models.TaskDTO) (privateKey, publicKey string, err error) {
 	projectID := task.ProjectID
 
 	// Проверяем существование ключей для проекта
-	if os.sshStorage.ProjectKeyPairExists(projectID) {
-		// Ключи существуют
-		keyPair, err := os.sshStorage.GetProjectKeyPair(projectID)
+	if os.projectKeyManager.KeyPairExists(projectID) {
+		// Ключи проекта уже существуют - используем их
+		privateKey, publicKey, err := os.projectKeyManager.GetKeyPair(projectID)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get project key pair: %w", err)
+			return "", "", fmt.Errorf("failed to get project key pair: %w", err)
 		}
+
+		os.logger.Info("Using existing project SSH keys",
+			zap.String("projectID", projectID))
 
 		// Если публичный ключ передан в задаче, проверяем его
 		if task.PublicKey != nil && *task.PublicKey != "" {
-			isValid, err := os.sshStorage.ValidateProjectPublicKey(projectID, *task.PublicKey)
+			isValid, err := os.projectKeyManager.ValidatePublicKey(projectID, *task.PublicKey)
 			if err != nil {
 				os.logger.Error("Failed to validate public key",
 					zap.String("projectID", projectID),
 					zap.Error(err))
-				return nil, fmt.Errorf("failed to validate public key: %w", err)
+				return "", "", fmt.Errorf("failed to validate public key: %w", err)
 			}
 
 			if !isValid {
@@ -205,36 +268,52 @@ func (os *OrchestratorService) validateAndPrepareProjectKey(ctx context.Context,
 			}
 		}
 
-		// Ключи валидны
-		return keyPair, nil
+		// Ключи валидны - возвращаем их для передачи агенту
+		return privateKey, publicKey, nil
 	}
 
-	// Ключей нет - генерируем новую пару
-	os.logger.Info("Project keys not found, generating new key pair",
+	// Ключей нет - генерируем новую пару для проекта
+	os.logger.Info("Project keys not found, generating new SSH key pair for project",
 		zap.String("projectID", projectID))
 	return os.generateAndRegisterProjectKey(ctx, projectID)
 }
 
-// generateAndRegisterProjectKey генерирует новую пару ключей и отправляет публичный ключ в API
-func (os *OrchestratorService) generateAndRegisterProjectKey(ctx context.Context, projectID string) (*ssh.ProjectKeyPair, error) {
-	// Генерируем новую пару ключей
-	keyPair, err := os.sshStorage.GenerateAndStoreProjectKeyPair(projectID)
+// generateAndRegisterProjectKey генерирует новую пару SSH ключей для проекта
+// и регистрирует публичный ключ в External API
+// ВАЖНО: Ключи генерируются ОДИН РАЗ для всего проекта, не для каждого агента!
+func (os *OrchestratorService) generateAndRegisterProjectKey(ctx context.Context, projectID string) (privateKey, publicKey string, err error) {
+	os.logger.Info("Generating NEW SSH key pair for project (will be shared by all agents)",
+		zap.String("projectID", projectID))
+
+	// Генерируем новую пару ключей для проекта
+	privateKey, publicKey, err = os.projectKeyManager.GenerateKeyPair(projectID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate project key pair: %w", err)
+		return "", "", fmt.Errorf("failed to generate project key pair: %w", err)
 	}
 
-	// Отправляем публичный ключ в API
-	if err := os.taskClient.UpdateProjectPublicKey(ctx, projectID, keyPair.PublicKey); err != nil {
+	// Отправляем публичный ключ в External API
+	// External API сохранит его в БД и зарегистрирует в GitHub/GitLab
+	if err := os.taskClient.UpdateProjectPublicKey(ctx, projectID, publicKey); err != nil {
 		os.logger.Error("Failed to update project public key in API",
 			zap.String("projectID", projectID),
 			zap.Error(err))
 		// Не критично - ключи уже сохранены локально, продолжаем
 	} else {
-		os.logger.Info("Successfully registered project public key",
-			zap.String("projectID", projectID))
+		os.logger.Info("Successfully registered project public key in External API",
+			zap.String("projectID", projectID),
+			zap.String("publicKeyPrefix", publicKey[:min(50, len(publicKey))]+"..."))
 	}
 
-	return keyPair, nil
+	// Возвращаем приватный ключ для передачи агенту
+	return privateKey, publicKey, nil
+}
+
+// min возвращает минимум из двух чисел
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // startAgentForTask запуск агента для задачи
@@ -246,13 +325,19 @@ func (os *OrchestratorService) startAgentForTask(ctx context.Context, task *mode
 	os.logger.Info("Starting agent for task",
 		zap.String("agentID", agentID),
 		zap.String("taskID", task.ID),
+		zap.String("agentUUID", task.AgentUUID),
 		zap.String("projectID", task.ProjectID))
 
-	// Проверить и подготовить SSH ключи проекта
-	projectKeys, err := os.validateAndPrepareProjectKey(ctx, task)
+	// Получить SSH ключи проекта (генерируются один раз для всего проекта)
+	// Все агенты этого проекта будут использовать ОДИНАКОВЫЕ ключи
+	privateKey, _, err := os.validateAndPrepareProjectKey(ctx, task)
 	if err != nil {
 		return fmt.Errorf("failed to validate project keys: %w", err)
 	}
+
+	os.logger.Info("Passing project SSH private key to agent",
+		zap.String("projectID", task.ProjectID),
+		zap.String("agentUUID", task.AgentUUID))
 
 	// Подготовить параметры для агента
 	var contextVolumeID *string
@@ -274,12 +359,14 @@ func (os *OrchestratorService) startAgentForTask(ctx context.Context, task *mode
 	}
 
 	// Запустить агента с приватным ключом проекта
+	// ВАЖНО: privateKey - это ключ ПРОЕКТА, общий для всех агентов проекта
 	agentMeta, err := os.agentService.StartAgentForTask(
 		configOptions,
 		task.ID,
+		task.AgentUUID, // Передать agent_uuid
 		contextVolumeID,
 		memoryLimit,
-		projectKeys.PrivateKey, // Передаем приватный ключ проекта
+		privateKey, // Приватный ключ ПРОЕКТА (не агента!)
 	)
 	if err != nil {
 		// Если не удалось запустить агента, освободить контекст
@@ -422,12 +509,8 @@ func (os *OrchestratorService) handleAgentCompletion(ctx context.Context, contai
 		os.logger.Error("Failed to delete agent state", zap.String("agentID", agentState.AgentID), zap.Error(err))
 	}
 
-	// Отметить задачу как выполненную в внешнем API
-	if err := os.taskClient.MarkTaskCompleted(ctx, agentState.TaskID); err != nil {
-		os.logger.Error("Failed to mark task as completed", zap.String("taskID", agentState.TaskID), zap.Error(err))
-	}
-
-	os.logger.Info("Successfully handled agent completion", zap.String("containerID", containerID))
+	// Агент самостоятельно отмечает задачу как выполненную через свой API
+	os.logger.Info("Successfully handled agent completion", zap.String("containerID", containerID), zap.String("taskID", agentState.TaskID))
 	return nil
 }
 

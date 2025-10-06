@@ -53,6 +53,12 @@ var (
 		Name: "orchestrator_active_agents",
 		Help: "Number of currently active agents",
 	})
+
+	// Task reservation metrics
+	TaskReservationConflictsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "orchestrator_task_reservation_conflicts_total",
+		Help: "Total number of task reservation conflicts (409 Conflict responses)",
+	})
 )
 
 // RunningContainersCollector - кастомный коллектор для подсчета запущенных контейнеров
@@ -109,6 +115,7 @@ func Register() {
 		AvailableMemoryBytes,
 		UsedMemoryBytes,
 		ActiveAgents,
+		TaskReservationConflictsTotal,
 	)
 }
 
@@ -124,6 +131,7 @@ func RegisterWithDockerClient(dc docker.DockerClient) {
 		AvailableMemoryBytes,
 		UsedMemoryBytes,
 		ActiveAgents,
+		TaskReservationConflictsTotal,
 		NewRunningContainersCollector(dc),
 	)
 }

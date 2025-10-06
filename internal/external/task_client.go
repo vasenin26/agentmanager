@@ -13,12 +13,14 @@ import (
 )
 
 type TaskClient struct {
-	baseURL    string
+	baseURL    string // Base URL с префиксом API, например: https://api.example.com/api/v1/orchestrator
 	token      string
 	httpClient *http.Client
 	logger     *zap.Logger
 }
 
+// NewTaskClient создает новый клиент для Task API
+// baseURL должен включать префикс API, например: https://api.example.com/api/v1/orchestrator
 func NewTaskClient(baseURL, token string, timeout time.Duration, logger *zap.Logger) *TaskClient {
 	return &TaskClient{
 		baseURL: baseURL,
@@ -63,14 +65,25 @@ func (c *TaskClient) FetchTask(ctx context.Context) (*models.TaskDTO, error) {
 	return &task, nil
 }
 
-// MarkTaskCompleted отмечает задачу как выполненную
-func (c *TaskClient) MarkTaskCompleted(ctx context.Context, taskID string) error {
-	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/tasks/"+taskID+"/complete", nil)
+// ReserveTask резервирует задачу с указанием времени до запуска агента и UUID воркера
+func (c *TaskClient) ReserveTask(ctx context.Context, taskID string, reserveSeconds int, agentUUID string) error {
+	payload := map[string]interface{}{
+		"reserve_seconds": reserveSeconds,
+		"agent_uuid":      agentUUID,
+	}
+
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/tasks/"+taskID+"/reserve", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return err
 	}
 
 	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -78,11 +91,30 @@ func (c *TaskClient) MarkTaskCompleted(ctx context.Context, taskID string) error
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusConflict {
+		// Обработать конфликт резервирования
+		var conflictResp struct {
+			Error         string `json:"error"`
+			ReservedBy    string `json:"reserved_by,omitempty"`
+			ReservedUntil string `json:"reserved_until,omitempty"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&conflictResp); err == nil {
+			c.logger.Warn("Task reservation conflict",
+				zap.String("taskID", taskID),
+				zap.String("error", conflictResp.Error),
+				zap.String("reserved_until", conflictResp.ReservedUntil))
+		}
+		return fmt.Errorf("task already reserved: %s", conflictResp.Error)
+	}
+
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
 		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
-	c.logger.Info("Marked task as completed", zap.String("taskID", taskID))
+	c.logger.Info("Reserved task",
+		zap.String("taskID", taskID),
+		zap.String("agentUUID", agentUUID),
+		zap.Int("reserveSeconds", reserveSeconds))
 	return nil
 }
 

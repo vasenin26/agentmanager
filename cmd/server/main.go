@@ -41,15 +41,9 @@ func main() {
 		}
 	}()
 
-	// Create SSH storage
-	sshStorage, err := ssh.NewStorage(cfg.SSHKeysDir)
-	if err != nil {
-		l.Fatal("Failed to create SSH storage", zap.Error(err))
-	}
-
 	reg := docker.AuthConfig{Server: cfg.RegistryServer, Username: cfg.RegistryUsername, Password: cfg.RegistryPassword}
 	serverURL := fmt.Sprintf("http://localhost:%s", cfg.HTTPPort)
-	agentSvc := service.NewAgentService(dc, reg, cfg.DefaultTimeout, serverURL, sshStorage,
+	agentSvc := service.NewAgentService(dc, reg, cfg.DefaultTimeout, serverURL,
 		cfg.APIHost, cfg.OpenAIModel, cfg.OpenAIAPIKey, cfg.GitUserName, cfg.GitUserEmail)
 
 	// Orchestrator (всегда включен)
@@ -102,6 +96,12 @@ func main() {
 			l,
 		)
 
+		// Создать ProjectKeyManager для управления SSH ключами проектов
+		projectKeyManager, err := ssh.NewProjectKeyManager(cfg.SSHKeysDir)
+		if err != nil {
+			l.Fatal("Failed to create project key manager", zap.Error(err))
+		}
+
 		// Создать оркестратор
 		orchestrator = service.NewOrchestratorService(
 			dc,
@@ -111,7 +111,7 @@ func main() {
 			queueService,
 			agentStateStorage,
 			agentSvc,
-			sshStorage, // SSH storage для управления ключами проектов
+			projectKeyManager, // Управление SSH ключами проектов
 			cfg.AgentAPIToken,
 			cfg.TaskPollInterval,
 			l,

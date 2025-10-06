@@ -7,7 +7,6 @@ import (
 
 	"github.com/vasenin26/agentmanager/internal/docker"
 	"github.com/vasenin26/agentmanager/internal/models"
-	"github.com/vasenin26/agentmanager/internal/ssh"
 )
 
 type AgentService struct {
@@ -15,8 +14,6 @@ type AgentService struct {
 	registry       docker.AuthConfig
 	defaultTimeout time.Duration
 	serverURL      string
-	// SSH key storage
-	sshStorage *ssh.Storage
 	// Agent configuration
 	apiHost      string
 	openaiModel  string
@@ -25,13 +22,12 @@ type AgentService struct {
 	gitUserEmail string
 }
 
-func NewAgentService(dc docker.DockerClient, reg docker.AuthConfig, t time.Duration, serverURL string, sshStorage *ssh.Storage, apiHost, openaiModel, openaiApiKey, gitUserName, gitUserEmail string) *AgentService {
+func NewAgentService(dc docker.DockerClient, reg docker.AuthConfig, t time.Duration, serverURL string, apiHost, openaiModel, openaiApiKey, gitUserName, gitUserEmail string) *AgentService {
 	return &AgentService{
 		dc:             dc,
 		registry:       reg,
 		defaultTimeout: t,
 		serverURL:      serverURL,
-		sshStorage:     sshStorage,
 		apiHost:        apiHost,
 		openaiModel:    openaiModel,
 		openaiApiKey:   openaiApiKey,
@@ -44,6 +40,7 @@ func NewAgentService(dc docker.DockerClient, reg docker.AuthConfig, t time.Durat
 func (as *AgentService) StartAgentForTask(
 	configOptions models.ConfigOptions,
 	taskID string,
+	agentUUID string, // UUID воркера для резервирования
 	contextVolumeID *string,
 	memoryLimit int64,
 	projectPrivateKey string, // Приватный ключ проекта
@@ -51,15 +48,6 @@ func (as *AgentService) StartAgentForTask(
 	ctx := context.Background()
 	ctx, cancel := context.WithTimeout(ctx, as.defaultTimeout)
 	defer cancel()
-
-	// SSH ключи (существующая логика)
-	sshKeyPair, err := as.sshStorage.GetKeyPair(configOptions.AgentID.String())
-	if err != nil {
-		sshKeyPair, err = as.sshStorage.GenerateAndStoreKeyPair(configOptions.AgentID.String())
-		if err != nil {
-			return models.AgentMeta{}, err
-		}
-	}
 
 	// Image
 	image := os.Getenv("AGENT_IMAGE")
@@ -87,16 +75,16 @@ func (as *AgentService) StartAgentForTask(
 		MemoryLimit: memoryLimit,
 		Volumes:     volumes,
 		Env: map[string]string{
-			"AGENT_ID":                configOptions.AgentID.String(),
-			"API_TOKEN":               configOptions.Token,
-			"TASK_ID":                 taskID,                // Новая переменная
-			"SSH_PRIVATE_KEY":         sshKeyPair.PrivateKey, // SSH ключ агента (для Git операций агента)
-			"PROJECT_SSH_PRIVATE_KEY": projectPrivateKey,     // SSH ключ проекта (для клонирования репозитория)
-			"API_HOST":                as.apiHost,
-			"OPENAI_MODEL":            as.openaiModel,
-			"OPENAI_API_KEY":          as.openaiApiKey,
-			"GIT_USER_NAME":           as.gitUserName,
-			"GIT_USER_EMAIL":          as.gitUserEmail,
+			"AGENT_ID":        configOptions.AgentID.String(),
+			"AGENT_UUID":      agentUUID, // UUID воркера для резервирования
+			"TASK_ID":         taskID,    // ID задачи для получения деталей
+			"API_TOKEN":       configOptions.Token,
+			"SSH_PRIVATE_KEY": projectPrivateKey, // ВАЖНО: это ключ ПРОЕКТА, не агента!
+			"API_HOST":        as.apiHost,
+			"OPENAI_MODEL":    as.openaiModel,
+			"OPENAI_API_KEY":  as.openaiApiKey,
+			"GIT_USER_NAME":   as.gitUserName,
+			"GIT_USER_EMAIL":  as.gitUserEmail,
 		},
 	}
 
@@ -110,8 +98,7 @@ func (as *AgentService) StartAgentForTask(
 	}
 
 	return models.AgentMeta{
-		Server:    as.serverURL,
-		AgentID:   configOptions.AgentID.String(),
-		PublicKey: sshKeyPair.PublicKey,
+		Server:  as.serverURL,
+		AgentID: configOptions.AgentID.String(),
 	}, nil
 }

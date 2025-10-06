@@ -18,7 +18,7 @@ services:
       - GIT_USER_NAME=${GIT_USER_NAME}
       - GIT_USER_EMAIL=${GIT_USER_EMAIL}
       - BOLT_DB_PATH=/app/data/orchestrator.db
-      - TASK_API_URL=${TASK_API_URL}
+      - TASK_API_URL=${TASK_API_URL}  # Например: https://api.example.com/api/v1/orchestrator
       - TASK_API_TOKEN=${TASK_API_TOKEN}
       - TASK_API_TIMEOUT=${TASK_API_TIMEOUT:-10s}
       - TASK_POLL_INTERVAL=${TASK_POLL_INTERVAL:-5s}

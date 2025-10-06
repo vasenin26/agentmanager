@@ -23,7 +23,6 @@ services:
       - TASK_API_TIMEOUT=${TASK_API_TIMEOUT:-10s}
       - TASK_POLL_INTERVAL=${TASK_POLL_INTERVAL:-5s}
       - AGENT_MEMORY_LIMIT_MB=${AGENT_MEMORY_LIMIT_MB:-512}
-      - ORCHESTRATOR_ENABLED=${ORCHESTRATOR_ENABLED:-true}
       - AGENT_API_TOKEN=${AGENT_API_TOKEN}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock

@@ -34,9 +34,8 @@ type Config struct {
 	// Agent Memory
 	AgentMemoryLimitMB int64
 
-	// Orchestrator
-	OrchestratorEnabled bool
-	AgentAPIToken       string // Общий токен для всех агентов
+	// Orchestrator (всегда включен)
+	AgentAPIToken string // Общий токен для всех агентов
 }
 
 func Load() Config {
@@ -76,11 +75,6 @@ func Load() Config {
 		}
 	}
 
-	orchestratorEnabled := true
-	if v := os.Getenv("ORCHESTRATOR_ENABLED"); v != "" {
-		orchestratorEnabled = v != "false" && v != "0"
-	}
-
 	agentAPIToken := os.Getenv("AGENT_API_TOKEN")
 	if agentAPIToken == "" {
 		agentAPIToken = "default-agent-token" // Значение по умолчанию
@@ -102,13 +96,12 @@ func Load() Config {
 		GitUserName:  os.Getenv("GIT_USER_NAME"),
 		GitUserEmail: os.Getenv("GIT_USER_EMAIL"),
 		// Orchestrator configuration
-		BoltDBPath:          boltDBPath,
-		TaskAPIURL:          os.Getenv("TASK_API_URL"),
-		TaskAPIToken:        os.Getenv("TASK_API_TOKEN"),
-		TaskAPITimeout:      taskAPITimeout,
-		TaskPollInterval:    taskPollInterval,
-		AgentMemoryLimitMB:  agentMemoryLimitMB,
-		OrchestratorEnabled: orchestratorEnabled,
-		AgentAPIToken:       agentAPIToken,
+		BoltDBPath:         boltDBPath,
+		TaskAPIURL:         os.Getenv("TASK_API_URL"),
+		TaskAPIToken:       os.Getenv("TASK_API_TOKEN"),
+		TaskAPITimeout:     taskAPITimeout,
+		TaskPollInterval:   taskPollInterval,
+		AgentMemoryLimitMB: agentMemoryLimitMB,
+		AgentAPIToken:      agentAPIToken,
 	}
 }

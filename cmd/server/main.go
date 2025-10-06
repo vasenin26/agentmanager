@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/vasenin26/agentmanager/internal/api"
+	promhttp "github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/vasenin26/agentmanager/internal/config"
 	"github.com/vasenin26/agentmanager/internal/docker"
 	"github.com/vasenin26/agentmanager/internal/external"
@@ -52,13 +52,9 @@ func main() {
 	agentSvc := service.NewAgentService(dc, reg, cfg.DefaultTimeout, serverURL, sshStorage,
 		cfg.APIHost, cfg.OpenAIModel, cfg.OpenAIAPIKey, cfg.GitUserName, cfg.GitUserEmail)
 
-	// API handlers and router
-	h := api.NewHandlers(agentSvc)
-	router := api.NewRouter(h)
-
-	// Orchestrator (если включен)
+	// Orchestrator (всегда включен)
 	var orchestrator *service.OrchestratorService
-	if cfg.OrchestratorEnabled && cfg.TaskAPIURL != "" {
+	if cfg.TaskAPIURL != "" {
 		l.Info("Orchestrator is enabled, initializing...")
 
 		// Создать директорию для БД если не существует
@@ -128,17 +124,21 @@ func main() {
 		go orchestrator.Start(ctx)
 		l.Info("Orchestrator started")
 	} else {
-		l.Info("Orchestrator is disabled")
+		l.Fatal("TASK_API_URL is required")
 	}
 
-	// Запустить HTTP сервер
+	// Запустить HTTP сервер только с метриками
 	addr := fmt.Sprintf(":%s", cfg.HTTPPort)
-	l.Sugar().Infof("starting server on %s", addr)
+	l.Sugar().Infof("starting metrics server on %s", addr)
+
+	// Создаем HTTP mux только с метриками
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
 
 	// Graceful shutdown
 	server := &http.Server{
 		Addr:    addr,
-		Handler: router,
+		Handler: mux,
 	}
 
 	go func() {

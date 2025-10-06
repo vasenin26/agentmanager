@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 
 	docker "github.com/fsouza/go-dockerclient"
@@ -32,6 +33,18 @@ func New(logger *zap.Logger) (DockerClient, error) {
 // Реализация методов для realDocker
 
 func (r *realDocker) PullImage(ctx context.Context, image string, auth AuthConfig) error {
+	// Allow skipping image pull for local development
+	if v := strings.ToLower(os.Getenv("AGENT_IMAGE_PULL")); v == "false" || v == "0" {
+		r.logger.Info("Skipping image pull due to AGENT_IMAGE_PULL flag", zap.String("image", image))
+		return nil
+	}
+
+	// If image already exists locally, skip pulling
+	if img, err := r.client.InspectImage(image); err == nil && img != nil {
+		r.logger.Info("Image exists locally, skipping pull", zap.String("image", image))
+		return nil
+	}
+
 	r.logger.Info("Pulling image",
 		zap.String("image", image),
 		zap.String("registry", auth.Server),
@@ -80,11 +93,21 @@ func (r *realDocker) CreateContainer(ctx context.Context, cfg ContainerConfig) (
 		env = append(env, fmt.Sprintf("%s=%s", key, value))
 	}
 
+	// Подготавливаем binds для volumes
+	var binds []string
+	for _, vol := range cfg.Volumes {
+		binds = append(binds, fmt.Sprintf("%s:%s", vol.VolumeID, vol.MountPath))
+	}
+
 	containerConfig := &docker.Config{
 		Image: cfg.Image,
 		Env:   env,
 	}
-	hostConfig := &docker.HostConfig{AutoRemove: true}
+	hostConfig := &docker.HostConfig{
+		AutoRemove: true,
+		Memory:     cfg.MemoryLimit,
+		Binds:      binds,
+	}
 
 	created, err := r.client.CreateContainer(docker.CreateContainerOptions{
 		Config:     containerConfig,
@@ -195,4 +218,82 @@ func (r *realDocker) ListRunnedContainers(ctx context.Context) ([]ContainerInspe
 	}
 
 	return result, nil
+}
+
+func (r *realDocker) CreateVolume(ctx context.Context, name string) (string, error) {
+	r.logger.Info("Creating volume", zap.String("name", name))
+
+	volume, err := r.client.CreateVolume(docker.CreateVolumeOptions{
+		Name:   name,
+		Driver: "local",
+	})
+	if err != nil {
+		r.logger.Error("Failed to create volume", zap.String("name", name), zap.Error(err))
+		return "", fmt.Errorf("failed to create volume: %w", err)
+	}
+
+	r.logger.Info("Successfully created volume", zap.String("volumeID", volume.Name))
+	return volume.Name, nil
+}
+
+func (r *realDocker) DeleteVolume(ctx context.Context, volumeID string) error {
+	r.logger.Info("Deleting volume", zap.String("volumeID", volumeID))
+
+	err := r.client.RemoveVolume(volumeID)
+	if err != nil {
+		r.logger.Error("Failed to delete volume", zap.String("volumeID", volumeID), zap.Error(err))
+		return fmt.Errorf("failed to delete volume: %w", err)
+	}
+
+	r.logger.Info("Successfully deleted volume", zap.String("volumeID", volumeID))
+	return nil
+}
+
+func (r *realDocker) ListenEvents(ctx context.Context, eventChan chan<- DockerEvent) error {
+	r.logger.Info("Starting Docker event listener")
+
+	listener := make(chan *docker.APIEvents)
+
+	err := r.client.AddEventListener(listener)
+	if err != nil {
+		r.logger.Error("Failed to add event listener", zap.Error(err))
+		return fmt.Errorf("failed to add event listener: %w", err)
+	}
+
+	go func() {
+		defer r.client.RemoveEventListener(listener)
+		for {
+			select {
+			case event := <-listener:
+				if event.Type == "container" && (event.Status == "die" || event.Status == "stop") {
+					exitCode := 0
+					if exitCodeStr, ok := event.Actor.Attributes["exitCode"]; ok {
+						fmt.Sscanf(exitCodeStr, "%d", &exitCode)
+					}
+					eventChan <- DockerEvent{
+						ContainerID: event.Actor.ID,
+						Status:      event.Status,
+						ExitCode:    exitCode,
+					}
+				}
+			case <-ctx.Done():
+				r.logger.Info("Stopping Docker event listener")
+				return
+			}
+		}
+	}()
+
+	return nil
+}
+
+func (r *realDocker) GetSystemMemory(ctx context.Context) (int64, error) {
+	r.logger.Debug("Getting system memory")
+
+	info, err := r.client.Info()
+	if err != nil {
+		r.logger.Error("Failed to get system info", zap.Error(err))
+		return 0, fmt.Errorf("failed to get system info: %w", err)
+	}
+
+	return info.MemTotal, nil
 }

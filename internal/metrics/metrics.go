@@ -15,6 +15,52 @@ var (
 	ContainerStartCommands = prometheus.NewCounter(prometheus.CounterOpts{Name: "container_start_commands_total", Help: "Total container start commands"})
 	ContainerStopCommands  = prometheus.NewCounter(prometheus.CounterOpts{Name: "container_stop_commands_total", Help: "Total container stop commands"})
 	ProcessStartCommands   = prometheus.NewCounter(prometheus.CounterOpts{Name: "process_start_commands_total", Help: "Total process start commands"})
+	
+	// Orchestrator metrics
+	TasksFetchedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "orchestrator_tasks_fetched_total",
+		Help: "Total number of tasks fetched from external API",
+	})
+	
+	TasksProcessedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "orchestrator_tasks_processed_total",
+		Help: "Total number of tasks processed successfully",
+	})
+	
+	TasksFailedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "orchestrator_tasks_failed_total",
+		Help: "Total number of tasks that failed",
+	})
+	
+	ContextsCreatedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "orchestrator_contexts_created_total",
+		Help: "Total number of contexts created",
+	})
+	
+	ContextsActive = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "orchestrator_contexts_active",
+		Help: "Number of currently active contexts",
+	})
+	
+	ContextQueueLength = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "orchestrator_context_queue_length",
+		Help: "Length of task queue for each context",
+	}, []string{"context_id"})
+	
+	AvailableMemoryBytes = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "orchestrator_available_memory_bytes",
+		Help: "Available memory in bytes",
+	})
+	
+	UsedMemoryBytes = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "orchestrator_used_memory_bytes",
+		Help: "Used memory by agents in bytes",
+	})
+	
+	ActiveAgents = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "orchestrator_active_agents",
+		Help: "Number of currently active agents",
+	})
 )
 
 // RunningContainersCollector - кастомный коллектор для подсчета запущенных контейнеров
@@ -61,10 +107,41 @@ func (c *RunningContainersCollector) Collect(ch chan<- prometheus.Metric) {
 }
 
 func Register() {
-	prometheus.MustRegister(CreatedAgents, AgentErrors, ContainerStartCommands, ContainerStopCommands, ProcessStartCommands)
+	prometheus.MustRegister(
+		CreatedAgents, 
+		AgentErrors, 
+		ContainerStartCommands, 
+		ContainerStopCommands, 
+		ProcessStartCommands,
+		TasksFetchedTotal,
+		TasksProcessedTotal,
+		TasksFailedTotal,
+		ContextsCreatedTotal,
+		ContextsActive,
+		ContextQueueLength,
+		AvailableMemoryBytes,
+		UsedMemoryBytes,
+		ActiveAgents,
+	)
 }
 
 // RegisterWithDockerClient регистрирует метрики с Docker клиентом
 func RegisterWithDockerClient(dc docker.DockerClient) {
-	prometheus.MustRegister(CreatedAgents, AgentErrors, ContainerStartCommands, ContainerStopCommands, ProcessStartCommands, NewRunningContainersCollector(dc))
+	prometheus.MustRegister(
+		CreatedAgents, 
+		AgentErrors, 
+		ContainerStartCommands, 
+		ContainerStopCommands, 
+		ProcessStartCommands,
+		TasksFetchedTotal,
+		TasksProcessedTotal,
+		TasksFailedTotal,
+		ContextsCreatedTotal,
+		ContextsActive,
+		ContextQueueLength,
+		AvailableMemoryBytes,
+		UsedMemoryBytes,
+		ActiveAgents,
+		NewRunningContainersCollector(dc),
+	)
 }

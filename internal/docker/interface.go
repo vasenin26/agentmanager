@@ -8,9 +8,16 @@ type AuthConfig struct {
 	Password string
 }
 
+type VolumeMount struct {
+	VolumeID  string
+	MountPath string
+}
+
 type ContainerConfig struct {
-	Image string
-	Env   map[string]string
+	Image       string
+	Env         map[string]string
+	MemoryLimit int64         // Лимит памяти в байтах
+	Volumes     []VolumeMount // Монтирование volumes
 }
 
 type ContainerInspect struct {
@@ -20,6 +27,12 @@ type ContainerInspect struct {
 	CreatedAt string
 }
 
+type DockerEvent struct {
+	ContainerID string
+	Status      string // "die", "stop", "start"
+	ExitCode    int
+}
+
 type DockerClient interface {
 	PullImage(ctx context.Context, image string, auth AuthConfig) error
 	CreateContainer(ctx context.Context, cfg ContainerConfig) (string, error)
@@ -27,5 +40,9 @@ type DockerClient interface {
 	StopContainer(ctx context.Context, id string) error
 	ListRunnedContainers(ctx context.Context) ([]ContainerInspect, error)
 	InspectContainer(ctx context.Context, id string) (ContainerInspect, error)
+	CreateVolume(ctx context.Context, name string) (string, error)
+	DeleteVolume(ctx context.Context, volumeID string) error
+	ListenEvents(ctx context.Context, eventChan chan<- DockerEvent) error
+	GetSystemMemory(ctx context.Context) (int64, error)
 	Close() error
 }

@@ -17,9 +17,18 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - GIT_USER_NAME=${GIT_USER_NAME}
       - GIT_USER_EMAIL=${GIT_USER_EMAIL}
+      - BOLT_DB_PATH=/app/data/orchestrator.db
+      - TASK_API_URL=${TASK_API_URL}
+      - TASK_API_TOKEN=${TASK_API_TOKEN}
+      - TASK_API_TIMEOUT=${TASK_API_TIMEOUT:-10s}
+      - TASK_POLL_INTERVAL=${TASK_POLL_INTERVAL:-5s}
+      - AGENT_MEMORY_LIMIT_MB=${AGENT_MEMORY_LIMIT_MB:-512}
+      - ORCHESTRATOR_ENABLED=${ORCHESTRATOR_ENABLED:-true}
+      - AGENT_API_TOKEN=${AGENT_API_TOKEN}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ssh_keys:/app/keys
+      - orchestrator_data:/app/data
     ports:
       - "${HTTP_PORT:-8080}:8080"
     restart: unless-stopped
@@ -43,5 +52,6 @@ services:
 
 volumes:
   ssh_keys:
+  orchestrator_data:
 
 

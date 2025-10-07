@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/joho/godotenv"
 	promhttp "github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/vasenin26/agentmanager/internal/config"
 	"github.com/vasenin26/agentmanager/internal/docker"
@@ -23,6 +24,9 @@ import (
 )
 
 func main() {
+	// Load environment variables from .env in project root (and parent for cmd/ layout)
+	_ = godotenv.Load(".env", filepath.Join("..", ".env"))
+
 	cfg := config.Load()
 	l, _ := logger.New()
 	defer l.Sync()

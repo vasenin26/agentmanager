@@ -147,16 +147,15 @@ func (os *OrchestratorService) processTask(ctx context.Context, task *models.Tas
 		zap.Int("reserveSeconds", reserveSeconds))
 
 	// Генерировать agent_uuid для воркера
-	agentUUID := uuid.New().String()
-	task.AgentUUID = agentUUID
+	task.AgentUUID = uuid.New().String()
 
 	// Зарезервировать задачу с указанием срока и UUID воркера
-	if err := os.taskClient.ReserveTask(ctx, task.ID, reserveSeconds, agentUUID); err != nil {
+	if err := os.taskClient.ReserveTask(ctx, task.ID, reserveSeconds, task.AgentUUID); err != nil {
 		// Проверить, не конфликт ли резервирования
 		if strings.Contains(err.Error(), "already reserved") {
 			os.logger.Warn("Task reservation conflict, skipping task",
 				zap.String("taskID", task.ID),
-				zap.String("agentUUID", agentUUID))
+				zap.String("agentUUID", task.AgentUUID))
 			metrics.TaskReservationConflictsTotal.Inc()
 			// Не критично - пропускаем задачу, получим следующую
 			return nil
@@ -164,7 +163,7 @@ func (os *OrchestratorService) processTask(ctx context.Context, task *models.Tas
 
 		os.logger.Error("Failed to reserve task",
 			zap.String("taskID", task.ID),
-			zap.String("agentUUID", agentUUID),
+			zap.String("agentUUID", task.AgentUUID),
 			zap.Error(err))
 		return fmt.Errorf("failed to reserve task: %w", err)
 	}
@@ -321,9 +320,7 @@ func (os *OrchestratorService) startAgentForTask(ctx context.Context, task *mode
 	os.mu.Lock()
 	defer os.mu.Unlock()
 
-	agentID := uuid.New().String()
 	os.logger.Info("Starting agent for task",
-		zap.String("agentID", agentID),
 		zap.String("taskID", task.ID),
 		zap.String("agentUUID", task.AgentUUID),
 		zap.String("projectID", task.ProjectID))
@@ -344,7 +341,7 @@ func (os *OrchestratorService) startAgentForTask(ctx context.Context, task *mode
 	if contextDTO != nil {
 		contextVolumeID = &contextDTO.VolumeID
 		// Занять контекст
-		if err := os.contextService.OccupyContext(ctx, contextDTO.ID, agentID); err != nil {
+		if err := os.contextService.OccupyContext(ctx, contextDTO.ID, task.AgentUUID); err != nil {
 			return fmt.Errorf("failed to occupy context: %w", err)
 		}
 	}
@@ -354,7 +351,7 @@ func (os *OrchestratorService) startAgentForTask(ctx context.Context, task *mode
 
 	// Создать ConfigOptions для агента
 	configOptions := models.ConfigOptions{
-		AgentID: uuid.MustParse(agentID),
+		AgentID: uuid.MustParse(task.AgentUUID),
 		Token:   os.agentAPIToken, // Общий токен из конфигурации оркестратора
 	}
 
@@ -394,7 +391,7 @@ func (os *OrchestratorService) startAgentForTask(ctx context.Context, task *mode
 	}
 
 	if containerID == "" {
-		os.logger.Error("Failed to find container for agent", zap.String("agentID", agentID))
+		os.logger.Error("Failed to find container for agent", zap.String("agentID", task.AgentUUID))
 		if contextDTO != nil {
 			os.contextService.ReleaseContext(ctx, contextDTO.ID)
 		}
@@ -429,7 +426,7 @@ func (os *OrchestratorService) startAgentForTask(ctx context.Context, task *mode
 	}
 
 	os.logger.Info("Successfully started agent for task",
-		zap.String("agentID", agentID),
+		zap.String("agentID", task.AgentUUID),
 		zap.String("containerID", containerID),
 		zap.String("taskID", task.ID))
 

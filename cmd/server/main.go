@@ -116,7 +116,7 @@ func main() {
 			agentStateStorage,
 			agentSvc,
 			projectKeyManager, // Управление SSH ключами проектов
-			cfg.AgentAPIToken,
+			cfg.TaskAPIToken,
 			cfg.TaskPollInterval,
 			l,
 		)

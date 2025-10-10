@@ -15,14 +15,15 @@ type AgentService struct {
 	defaultTimeout time.Duration
 	serverURL      string
 	// Agent configuration
-	apiHost      string
-	openaiModel  string
-	openaiApiKey string
-	gitUserName  string
-	gitUserEmail string
+	apiHost       string
+	openaiModel   string
+	openaiApiKey  string
+	openaiApiHost string
+	gitUserName   string
+	gitUserEmail  string
 }
 
-func NewAgentService(dc docker.DockerClient, reg docker.AuthConfig, t time.Duration, serverURL string, apiHost, openaiModel, openaiApiKey, gitUserName, gitUserEmail string) *AgentService {
+func NewAgentService(dc docker.DockerClient, reg docker.AuthConfig, t time.Duration, serverURL string, apiHost, openaiModel, openaiApiKey, openaiApiHost, gitUserName, gitUserEmail string) *AgentService {
 	return &AgentService{
 		dc:             dc,
 		registry:       reg,
@@ -31,6 +32,7 @@ func NewAgentService(dc docker.DockerClient, reg docker.AuthConfig, t time.Durat
 		apiHost:        apiHost,
 		openaiModel:    openaiModel,
 		openaiApiKey:   openaiApiKey,
+		openaiApiHost:  openaiApiHost,
 		gitUserName:    gitUserName,
 		gitUserEmail:   gitUserEmail,
 	}
@@ -70,22 +72,29 @@ func (as *AgentService) StartAgentForTask(
 	}
 
 	// Create container config
+	env := map[string]string{
+		"AGENT_ID":        configOptions.AgentID.String(),
+		"AGENT_UUID":      agentUUID, // UUID воркера для резервирования
+		"TASK_ID":         taskID,    // ID задачи для получения деталей
+		"API_TOKEN":       configOptions.Token,
+		"SSH_PRIVATE_KEY": projectPrivateKey, // ВАЖНО: это ключ ПРОЕКТА, не агента!
+		"API_HOST":        as.apiHost,
+		"OPENAI_MODEL":    as.openaiModel,
+		"OPENAI_API_KEY":  as.openaiApiKey,
+		"GIT_USER_NAME":   as.gitUserName,
+		"GIT_USER_EMAIL":  as.gitUserEmail,
+	}
+
+	// Add OPENAI_API_HOST if not empty
+	if as.openaiApiHost != "" {
+		env["OPENAI_API_HOST"] = as.openaiApiHost
+	}
+
 	containerConfig := docker.ContainerConfig{
 		Image:       image,
 		MemoryLimit: memoryLimit,
 		Volumes:     volumes,
-		Env: map[string]string{
-			"AGENT_ID":        configOptions.AgentID.String(),
-			"AGENT_UUID":      agentUUID, // UUID воркера для резервирования
-			"TASK_ID":         taskID,    // ID задачи для получения деталей
-			"API_TOKEN":       configOptions.Token,
-			"SSH_PRIVATE_KEY": projectPrivateKey, // ВАЖНО: это ключ ПРОЕКТА, не агента!
-			"API_HOST":        as.apiHost,
-			"OPENAI_MODEL":    as.openaiModel,
-			"OPENAI_API_KEY":  as.openaiApiKey,
-			"GIT_USER_NAME":   as.gitUserName,
-			"GIT_USER_EMAIL":  as.gitUserEmail,
-		},
+		Env:         env,
 	}
 
 	containerID, err := as.dc.CreateContainer(ctx, containerConfig)

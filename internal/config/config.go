@@ -16,11 +16,12 @@ type Config struct {
 	// SSH keys storage
 	SSHKeysDir string
 	// Agent configuration
-	APIHost      string
-	OpenAIModel  string
-	OpenAIAPIKey string
-	GitUserName  string
-	GitUserEmail string
+	APIHost       string
+	OpenAIModel   string
+	OpenAIAPIKey  string
+	OpenAIApiHost string
+	GitUserName   string
+	GitUserEmail  string
 
 	// Bolt Database
 	BoltDBPath string
@@ -90,11 +91,12 @@ func Load() Config {
 		// SSH keys storage
 		SSHKeysDir: sshKeysDir,
 		// Agent configuration
-		APIHost:      os.Getenv("API_HOST"),
-		OpenAIModel:  os.Getenv("OPENAI_MODEL"),
-		OpenAIAPIKey: os.Getenv("OPENAI_API_KEY"),
-		GitUserName:  os.Getenv("GIT_USER_NAME"),
-		GitUserEmail: os.Getenv("GIT_USER_EMAIL"),
+		APIHost:       os.Getenv("API_HOST"),
+		OpenAIModel:   os.Getenv("OPENAI_MODEL"),
+		OpenAIAPIKey:  os.Getenv("OPENAI_API_KEY"),
+		OpenAIApiHost: os.Getenv("OPENAI_API_HOST"),
+		GitUserName:   os.Getenv("GIT_USER_NAME"),
+		GitUserEmail:  os.Getenv("GIT_USER_EMAIL"),
 		// Orchestrator configuration
 		BoltDBPath:         boltDBPath,
 		TaskAPIURL:         os.Getenv("TASK_API_URL"),

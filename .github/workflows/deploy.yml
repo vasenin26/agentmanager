@@ -51,6 +51,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Prepare compose filename
+        run: cp -f docker-compose.prod.yaml docker-compose.yaml
+
       - name: Prepare remote directory
         uses: appleboy/ssh-action@v0.1.10
         with:
@@ -71,8 +74,8 @@ jobs:
           username: ${{ vars.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
           port: ${{ vars.SSH_PORT || 22 }}
-          source: docker-compose.prod.yaml
-          target: ${{ env.REMOTE_DIR }}/docker-compose.yaml
+          source: docker-compose.yaml
+          target: ${{ env.REMOTE_DIR }}
           overwrite: true
 
       - name: Deploy via SSH (pull from GHCR)
@@ -95,9 +98,9 @@ jobs:
               echo "Token starts with: ${GHCR_TOKEN:0:10}..."
               echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
             fi
-            # Pull and recreate using docker-compose.yaml default name
-            IMAGE_TAG="${GITHUB_REF_NAME}" docker compose --env-file .env pull
-            IMAGE_TAG="${GITHUB_REF_NAME}" docker compose --env-file .env up -d
+            # Pull and recreate using the uploaded docker-compose.yaml
+            IMAGE_TAG="${GITHUB_REF_NAME}" docker compose -f docker-compose.yaml --env-file .env pull
+            IMAGE_TAG="${GITHUB_REF_NAME}" docker compose -f docker-compose.yaml --env-file .env up -d
             docker image prune -af || true
 
 

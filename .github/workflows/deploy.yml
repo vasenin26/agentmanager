@@ -44,28 +44,28 @@ jobs:
     needs: build-and-push
     runs-on: ubuntu-latest
     env:
-      REMOTE_DIR: ${{ secrets.REMOTE_DIR }}
+      REMOTE_DIR: ${{ vars.REMOTE_DIR || '/opt/agentmanager' }}
     steps:
       - name: Prepare remote directory
         uses: appleboy/ssh-action@v0.1.10
         with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
+          host: ${{ vars.SSH_HOST }}
+          username: ${{ vars.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
-          port: ${{ secrets.SSH_PORT || 22 }}
+          port: ${{ vars.SSH_PORT || 22 }}
           script_stop: true
           envs: REMOTE_DIR
           script: |
             set -euo pipefail
-            mkdir -p "${REMOTE_DIR:-/opt/agentmanager}"
+            mkdir -p "${REMOTE_DIR}"
 
       - name: Upload docker-compose file
         uses: appleboy/scp-action@v0.1.7
         with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
+          host: ${{ vars.SSH_HOST }}
+          username: ${{ vars.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
-          port: ${{ secrets.SSH_PORT || 22 }}
+          port: ${{ vars.SSH_PORT || 22 }}
           source: docker-compose.prod.yaml
           target: ${{ env.REMOTE_DIR }}
           overwrite: true
@@ -73,18 +73,21 @@ jobs:
       - name: Deploy via SSH (pull from GHCR)
         uses: appleboy/ssh-action@v0.1.10
         with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
+          host: ${{ vars.SSH_HOST }}
+          username: ${{ vars.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
-          port: ${{ secrets.SSH_PORT || 22 }}
+          port: ${{ vars.SSH_PORT || 22 }}
           script_stop: true
           envs: GITHUB_REF_NAME,REMOTE_DIR,GHCR_USERNAME,GHCR_TOKEN
           script: |
             set -euo pipefail
             # Ensure working dir and compose file exist on server ahead of time
-            cd "${REMOTE_DIR:-/opt/agentmanager}"
+            cd "${REMOTE_DIR}"
             # Login to GHCR using PAT if provided, else anonymous pull (public repo)
             if [ -n "${GHCR_USERNAME:-}" ] && [ -n "${GHCR_TOKEN:-}" ]; then
+              echo "Logging into GHCR with username: $GHCR_USERNAME"
+              echo "Token length: ${#GHCR_TOKEN}"
+              echo "Token starts with: ${GHCR_TOKEN:0:10}..."
               echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
             fi
             # Pull and recreate passing the tag via environment without editing files

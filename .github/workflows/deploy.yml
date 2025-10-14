@@ -72,7 +72,7 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
           port: ${{ vars.SSH_PORT || 22 }}
           source: docker-compose.prod.yaml
-          target: ${{ env.REMOTE_DIR }}
+          target: ${{ env.REMOTE_DIR }}/docker-compose.yaml
           overwrite: true
 
       - name: Deploy via SSH (pull from GHCR)
@@ -95,9 +95,9 @@ jobs:
               echo "Token starts with: ${GHCR_TOKEN:0:10}..."
               echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
             fi
-            # Pull and recreate passing the tag via environment without editing files
-            IMAGE_TAG="${GITHUB_REF_NAME}" docker compose -f docker-compose.prod.yaml --env-file .env pull
-            IMAGE_TAG="${GITHUB_REF_NAME}" docker compose -f docker-compose.prod.yaml --env-file .env up -d
+            # Pull and recreate using docker-compose.yaml default name
+            IMAGE_TAG="${GITHUB_REF_NAME}" docker compose --env-file .env pull
+            IMAGE_TAG="${GITHUB_REF_NAME}" docker compose --env-file .env up -d
             docker image prune -af || true
 
 

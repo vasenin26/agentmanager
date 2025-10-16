@@ -360,6 +360,7 @@ func (os *OrchestratorService) startAgentForTask(ctx context.Context, task *mode
 	agentMeta, err := os.agentService.StartAgentForTask(
 		configOptions,
 		task.ID,
+		task.Model,
 		task.AgentUUID, // Передать agent_uuid
 		contextVolumeID,
 		memoryLimit,

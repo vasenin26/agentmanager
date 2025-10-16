@@ -2,11 +2,12 @@ package models
 
 // TaskDTO - задача из внешнего API
 type TaskDTO struct {
-	ID        string  `json:"id"`         // ID задачи
-	ContextID *string `json:"context_id"` // ID контекста (nil если контекст не требуется)
-	Timeout   int     `json:"timeout"`    // Таймаут выполнения в секундах
-	ProjectID string  `json:"project_id"` // ID проекта к которому привязана задача
-	PublicKey *string `json:"public_key"` // Публичный SSH ключ проекта (может быть nil)
+	ID        string  `json:"id"`          // ID задачи
+	Model     string  `json:"agent_model"` // Модель OpenAI (может быть nil)
+	ContextID *string `json:"context_id"`  // ID контекста (nil если контекст не требуется)
+	Timeout   int     `json:"timeout"`     // Таймаут выполнения в секундах
+	ProjectID string  `json:"project_id"`  // ID проекта к которому привязана задача
+	PublicKey *string `json:"public_key"`  // Публичный SSH ключ проекта (может быть nil)
 
 	// Локальные поля (не из API, генерируются оркестратором)
 	AgentUUID string `json:"-"` // UUID воркера для резервирования (генерируется локально)

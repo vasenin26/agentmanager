@@ -42,6 +42,7 @@ func NewAgentService(dc docker.DockerClient, reg docker.AuthConfig, t time.Durat
 func (as *AgentService) StartAgentForTask(
 	configOptions models.ConfigOptions,
 	taskID string,
+	model string,
 	agentUUID string, // UUID воркера для резервирования
 	contextVolumeID *string,
 	memoryLimit int64,
@@ -72,6 +73,12 @@ func (as *AgentService) StartAgentForTask(
 	}
 
 	// Create container config
+	// Compute model value without inline function to avoid syntax issues
+	openaiModelVal := as.openaiModel
+	if model != "" {
+		openaiModelVal = model
+	}
+
 	env := map[string]string{
 		"AGENT_ID":        configOptions.AgentID.String(),
 		"AGENT_UUID":      agentUUID, // UUID воркера для резервирования
@@ -79,7 +86,7 @@ func (as *AgentService) StartAgentForTask(
 		"API_TOKEN":       configOptions.Token,
 		"SSH_PRIVATE_KEY": projectPrivateKey, // ВАЖНО: это ключ ПРОЕКТА, не агента!
 		"API_HOST":        as.apiHost,
-		"OPENAI_MODEL":    as.openaiModel,
+		"OPENAI_MODEL":    openaiModelVal,
 		"OPENAI_API_KEY":  as.openaiApiKey,
 		"GIT_USER_NAME":   as.gitUserName,
 		"GIT_USER_EMAIL":  as.gitUserEmail,

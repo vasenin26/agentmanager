@@ -572,7 +572,9 @@ func (os *OrchestratorService) listenDockerEvents(ctx context.Context) {
 				zap.Int("exitCode", event.ExitCode))
 
 			// Определить тип завершения (успешное/сбой)
-			if event.Status == "die" || event.Status == "stop" {
+			// Обрабатываем только событие "die". Docker также генерирует "stop",
+			// что приводило к двойной обработке и двойному декременту метрик.
+			if event.Status == "die" {
 				if event.ExitCode == 0 {
 					// Успешное завершение
 					go os.handleAgentCompletion(context.Background(), event.ContainerID)

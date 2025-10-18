@@ -68,7 +68,7 @@ func (as *AgentService) StartAgentForTask(
 	if contextVolumeID != nil {
 		volumes = append(volumes, docker.VolumeMount{
 			VolumeID:  *contextVolumeID,
-			MountPath: "/repos",
+			MountPath: "/home/local/context",
 		})
 	}
 

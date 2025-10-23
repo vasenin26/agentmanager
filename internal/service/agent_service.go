@@ -97,11 +97,17 @@ func (as *AgentService) StartAgentForTask(
 		env["OPENAI_API_HOST"] = as.openaiApiHost
 	}
 
+	// Check AUTO_REMOVE_AGENT_CONTANERS environment variable
+	// Default is true (auto-remove enabled), can be disabled with "false" or "0"
+	autoRemove := os.Getenv("AUTO_REMOVE_AGENT_CONTANERS")
+	autoRemoveEnabled := autoRemove != "false" && autoRemove != "0"
+
 	containerConfig := docker.ContainerConfig{
 		Image:       image,
 		MemoryLimit: memoryLimit,
 		Volumes:     volumes,
 		Env:         env,
+		AutoRemove:  autoRemoveEnabled,
 	}
 
 	containerID, err := as.dc.CreateContainer(ctx, containerConfig)

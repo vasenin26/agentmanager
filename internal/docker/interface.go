@@ -18,6 +18,7 @@ type ContainerConfig struct {
 	Env         map[string]string
 	MemoryLimit int64         // Лимит памяти в байтах
 	Volumes     []VolumeMount // Монтирование volumes
+	AutoRemove  bool          // Автоматическое удаление контейнера после остановки
 }
 
 type ContainerInspect struct {

@@ -104,7 +104,7 @@ func (r *realDocker) CreateContainer(ctx context.Context, cfg ContainerConfig) (
 		Env:   env,
 	}
 	hostConfig := &docker.HostConfig{
-		AutoRemove: true,
+		AutoRemove: cfg.AutoRemove,
 		Memory:     cfg.MemoryLimit,
 		Binds:      binds,
 	}

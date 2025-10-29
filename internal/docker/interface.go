@@ -45,5 +45,6 @@ type DockerClient interface {
 	DeleteVolume(ctx context.Context, volumeID string) error
 	ListenEvents(ctx context.Context, eventChan chan<- DockerEvent) error
 	GetSystemMemory(ctx context.Context) (int64, error)
+	GetContainerMemoryUsage(ctx context.Context, id string) (int64, error)
 	Close() error
 }

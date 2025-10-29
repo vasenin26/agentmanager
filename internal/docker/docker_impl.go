@@ -297,3 +297,48 @@ func (r *realDocker) GetSystemMemory(ctx context.Context) (int64, error) {
 
 	return info.MemTotal, nil
 }
+
+func (r *realDocker) GetContainerMemoryUsage(ctx context.Context, containerID string) (int64, error) {
+	// Проверяем, существует ли контейнер и запущен ли он
+	container, err := r.client.InspectContainerWithOptions(docker.InspectContainerOptions{
+		ID: containerID,
+	})
+	if err != nil {
+		if _, ok := err.(*docker.NoSuchContainer); ok {
+			// Контейнер уже удалён — памяти не занимает
+			return 0, nil
+		}
+		return 0, fmt.Errorf("inspect container %s failed: %w", containerID, err)
+	}
+
+	if !container.State.Running {
+		// Контейнер остановлен — памяти не занимает
+		return 0, nil
+	}
+
+	stats := make(chan *docker.Stats)
+	done := make(chan bool, 1)
+
+	go func() {
+		err := r.client.Stats(docker.StatsOptions{
+			ID:     containerID,
+			Stats:  stats,
+			Stream: false,
+			Done:   done,
+		})
+		if err != nil {
+			close(stats)
+		}
+	}()
+
+	select {
+	case s := <-stats:
+		if s != nil {
+			return int64(s.MemoryStats.Usage), nil
+		}
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+
+	return 0, fmt.Errorf("failed to get memory stats for container %s", containerID)
+}

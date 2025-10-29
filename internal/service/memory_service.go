@@ -71,9 +71,35 @@ func (ms *MemoryService) CalculateUsedMemory(ctx context.Context) (int64, error)
 
 	var totalUsed int64
 	for _, agent := range agents {
-		totalUsed += agent.MemoryLimit
+		usage, err := ms.dockerClient.GetContainerMemoryUsage(ctx, agent.ContainerID)
+		if err != nil {
+			ms.logger.Warn("failed to get memory usage for container, using limit instead",
+				zap.String("agentID", agent.AgentID),
+				zap.Error(err),
+			)
+			usage = agent.MemoryLimit // fallback на лимит
+		}
+		totalUsed += usage
 	}
+
+	// Получаем общую память системы через Docker API
+	totalMemory, err := ms.dockerClient.GetSystemMemory(ctx)
+	if err != nil {
+		ms.logger.Error("failed to get system memory", zap.Error(err))
+		return totalUsed, err
+	}
+
+	availableMemory := totalMemory - totalUsed
+	if availableMemory < 0 {
+		availableMemory = 0
+	}
+
+	ms.logger.Info("Memory usage computed",
+		zap.Int64("totalMemory", totalMemory),
+		zap.Int64("usedMemory", totalUsed),
+		zap.Int64("availableMemory", availableMemory),
+		zap.Int64("agentMemoryLimit", ms.agentMemoryLimit),
+	)
 
 	return totalUsed, nil
 }
-

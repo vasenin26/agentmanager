@@ -502,6 +502,7 @@ func (os *OrchestratorService) handleAgentCompletion(ctx context.Context, contai
 				nextTask := &models.TaskDTO{
 					ID:        queueItem.TaskID,
 					ContextID: &contextID,
+					AgentUUID: uuid.New().String(),
 					Timeout:   0, // Timeout будет определен внешней системой
 				}
 

@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/vasenin26/agentmanager/internal/docker"
+	"github.com/vasenin26/agentmanager/internal/metrics"
 	"github.com/vasenin26/agentmanager/internal/models"
 	"github.com/vasenin26/agentmanager/internal/storage"
 	"go.uber.org/zap"
@@ -100,6 +101,9 @@ func (ms *MemoryService) CalculateUsedMemory(ctx context.Context) (int64, error)
 		zap.Int64("availableMemory", availableMemory),
 		zap.Int64("agentMemoryLimit", ms.agentMemoryLimit),
 	)
+
+	metrics.AvailableMemoryBytes.Set(float64(availableMemory))
+	metrics.UsedMemoryBytes.Set(float64(totalUsed))
 
 	return totalUsed, nil
 }

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -348,6 +349,16 @@ func (os *OrchestratorService) startAgentForTask(ctx context.Context, task *mode
 	privateKey, _, err := os.validateAndPrepareProjectKey(ctx, task)
 	if err != nil {
 		return fmt.Errorf("failed to validate project keys: %w", err)
+	}
+
+	if task.ProjectID == "" || task.AgentUUID == "" {
+		os.logger.Error("Wrong agent task params",
+			zap.String("taskId", task.ID),
+			zap.String("ContextID", *task.ContextID),
+			zap.String("ProjectID", task.ProjectID),
+			zap.String("agentUUID", task.AgentUUID))
+
+		return errors.New("wrong agent task params")
 	}
 
 	os.logger.Info("Passing project SSH private key to agent",

@@ -185,23 +185,41 @@ func (os *OrchestratorService) processTask(ctx context.Context, task *models.Tas
 		return fmt.Errorf("failed to get or create context: %w", err)
 	}
 
+	os.checkAvailableContaier(ctx, contextDTO)
+
 	// Проверить доступен ли контекст
 	if contextDTO.IsOccupied {
-		// Контекст занят - поместить задачу в локальную очередь контекста
-		os.logger.Info("Context is occupied, enqueuing task", zap.String("taskID", task.ID), zap.String("contextID", contextID))
-		if err := os.queueService.EnqueueTaskForContext(ctx, contextID, task.ID); err != nil {
-			return fmt.Errorf("failed to enqueue task: %w", err)
+		if !os.checkAvailableContaier(ctx, contextDTO) {
+			os.contextService.ReleaseContext(ctx, contextID)
+		} else {
+			// Контекст занят - поместить задачу в локальную очередь контекста
+			os.logger.Info("Context is occupied, enqueuing task", zap.String("taskID", task.ID), zap.String("contextID", contextID))
+			if err := os.queueService.EnqueueTaskForContext(ctx, contextID, task.ID); err != nil {
+				return fmt.Errorf("failed to enqueue task: %w", err)
+			}
+
+			// Обновить метрику длины очереди
+			queueLength, _ := os.queueService.GetQueueLength(ctx, contextID)
+			metrics.ContextQueueLength.WithLabelValues(contextID).Set(float64(queueLength))
+
+			return nil
 		}
-
-		// Обновить метрику длины очереди
-		queueLength, _ := os.queueService.GetQueueLength(ctx, contextID)
-		metrics.ContextQueueLength.WithLabelValues(contextID).Set(float64(queueLength))
-
-		return nil
 	}
 
 	// Контекст доступен - занять контекст и запустить агента
 	return os.startAgentForTask(ctx, task, contextDTO)
+}
+
+func (os *OrchestratorService) checkAvailableContaier(ctx context.Context, contextDTO *models.ContextDTO) bool {
+	agentState, err := os.agentStateStorage.GetAgentByContextID(ctx, *contextDTO.AgentID)
+
+	if err != nil {
+		return false
+	}
+
+	memoryUsage, _ := os.dockerClient.GetContainerMemoryUsage(ctx, agentState.ContainerID)
+
+	return memoryUsage != 0
 }
 
 // estimateTimeUntilStart прогнозирует время до запуска агента

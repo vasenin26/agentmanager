@@ -186,11 +186,11 @@ func (os *OrchestratorService) processTask(ctx context.Context, task *models.Tas
 		return fmt.Errorf("failed to get or create context: %w", err)
 	}
 
-	os.checkAvailableContaier(ctx, contextDTO)
+	os.checkAvailableContaier(ctx, *contextDTO)
 
 	// Проверить доступен ли контекст
 	if contextDTO.IsOccupied {
-		if !os.checkAvailableContaier(ctx, contextDTO) {
+		if !os.checkAvailableContaier(ctx, *contextDTO) {
 			os.contextService.ReleaseContext(ctx, contextID)
 		} else {
 			// Контекст занят - поместить задачу в локальную очередь контекста
@@ -211,8 +211,8 @@ func (os *OrchestratorService) processTask(ctx context.Context, task *models.Tas
 	return os.startAgentForTask(ctx, task, contextDTO)
 }
 
-func (os *OrchestratorService) checkAvailableContaier(ctx context.Context, contextDTO *models.ContextDTO) bool {
-	agentState, err := os.agentStateStorage.GetAgentByContextID(ctx, *contextDTO.AgentID)
+func (os *OrchestratorService) checkAvailableContaier(ctx context.Context, contextDTO models.ContextDTO) bool {
+	agentState, err := os.agentStateStorage.GetAgentByContextID(ctx, contextDTO.ID)
 
 	if err != nil {
 		return false

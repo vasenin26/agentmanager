@@ -55,7 +55,7 @@ services:
       - "3100:3100"
     command: -config.file=/etc/loki/config.yaml
     volumes:
-      - ./loki-config.yaml:/etc/loki/config.yaml
+      - ./docker/loki/loki-config.yaml:/etc/loki/config.yaml
       - loki_data:/loki
 
   promtail:
@@ -66,7 +66,7 @@ services:
     volumes:
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./promtail-config.yaml:/etc/promtail/config.yaml
+      - ./docker/promtail/promtail-config.yaml:/etc/promtail/config.yaml
     command: -config.file=/etc/promtail/config.yaml
 
 volumes:

@@ -33,6 +33,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: /docker/Dockerfile
           platforms: linux/amd64
           push: true
           tags: |
@@ -53,6 +54,12 @@ jobs:
 
       - name: Prepare compose filename
         run: cp -f docker-compose.prod.yaml docker-compose.yaml
+
+      - name: Prepare loki config
+        run: cp -f docker/loki/loki-config.yaml loki-config.yaml
+
+      - name: Prepare promtail config
+        run: cp -f docker/promtail/promtail-config.yaml promtail-config.yaml
 
       - name: Prepare remote directory
         uses: appleboy/ssh-action@v0.1.10

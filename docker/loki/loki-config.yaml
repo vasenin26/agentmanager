@@ -1,0 +1,37 @@
+server:
+  http_listen_port: 3100
+
+ingester:
+  wal:
+    enabled: true
+    dir: /loki/wal
+  chunk_idle_period: 5m
+  max_chunk_age: 1h
+  chunk_target_size: 1048576
+
+limits_config:
+  retention_period: 24h
+
+schema_config:
+  configs:
+    - from: 2020-10-24
+      store: boltdb-shipper
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+storage_config:
+  boltdb_shipper:
+    active_index_directory: /loki/index
+    cache_location: /loki/cache
+    shared_store: filesystem
+
+  filesystem:
+    directory: /loki/chunks
+
+compactor:
+  working_directory: /loki/compactor
+  shared_store: filesystem
+  retention_enabled: true

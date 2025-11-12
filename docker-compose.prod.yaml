@@ -56,7 +56,7 @@ services:
     command: -config.file=/etc/loki/config.yaml
     volumes:
       - ./loki-config.yaml:/etc/loki/config.yaml
-      - ./loki-data:/loki
+      - loki_data:/loki
 
   promtail:
     image: grafana/promtail:3.0.0
@@ -72,6 +72,6 @@ services:
 volumes:
   ssh_keys:
   orchestrator_data:
-  loki-data:
+  loki_data:
 
 

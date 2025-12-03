@@ -2,12 +2,15 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"time"
 
 	"github.com/vasenin26/agentmanager/internal/docker"
 	"github.com/vasenin26/agentmanager/internal/models"
 )
+
+const internalSocketPath = "/opt/terminal.sock"
 
 type AgentService struct {
 	dc             docker.DockerClient
@@ -70,6 +73,16 @@ func (as *AgentService) StartAgentForTask(
 			VolumeID:  *contextVolumeID,
 			MountPath: "/home/local/context",
 		})
+		// Mount command proxy socket file for this specific context
+		// Use same socket directory as in NewProxy
+		socketDir := os.Getenv("ORCHESTRATOR_SOCKET_DIR")
+		if socketDir == "" {
+			socketDir = "/tmp/orchestrator"
+		}
+		volumes = append(volumes, docker.VolumeMount{
+			VolumeID:  fmt.Sprintf("%s/%s.sock", socketDir, *contextVolumeID),
+			MountPath: internalSocketPath,
+		})
 	}
 
 	// Create container config
@@ -95,6 +108,12 @@ func (as *AgentService) StartAgentForTask(
 	// Add OPENAI_API_HOST if not empty
 	if as.openaiApiHost != "" {
 		env["OPENAI_API_HOST"] = as.openaiApiHost
+	}
+
+	// If agent has a context volume, provide the command-proxy socket path for that context
+	// Socket is mounted at /opt/terminal inside the agent container
+	if contextVolumeID != nil {
+		env["COMMAND_PROXY_SOCKET"] = internalSocketPath
 	}
 
 	// Check AUTO_REMOVE_AGENT_CONTANERS environment variable

@@ -118,6 +118,7 @@ func main() {
 			projectKeyManager, // Управление SSH ключами проектов
 			cfg.TaskAPIToken,
 			cfg.TaskPollInterval,
+			reg, // Registry config for pulling DinD images
 			l,
 		)
 

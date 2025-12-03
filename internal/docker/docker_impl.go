@@ -1,11 +1,13 @@
 package docker
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	docker "github.com/fsouza/go-dockerclient"
 	"go.uber.org/zap"
@@ -107,6 +109,7 @@ func (r *realDocker) CreateContainer(ctx context.Context, cfg ContainerConfig) (
 		AutoRemove: cfg.AutoRemove,
 		Memory:     cfg.MemoryLimit,
 		Binds:      binds,
+		Privileged: cfg.Privileged,
 	}
 
 	created, err := r.client.CreateContainer(docker.CreateContainerOptions{
@@ -196,6 +199,81 @@ func (r *realDocker) Close() error {
 		return nil
 	}
 	return nil
+}
+
+func (r *realDocker) RemoveContainer(ctx context.Context, id string) error {
+	r.logger.Info("Removing container", zap.String("containerID", id))
+
+	err := r.client.RemoveContainer(docker.RemoveContainerOptions{ID: id, Force: true, RemoveVolumes: false})
+	if err != nil {
+		r.logger.Error("Failed to remove container", zap.String("containerID", id), zap.Error(err))
+		return fmt.Errorf("failed to remove container %s: %w", id, err)
+	}
+
+	r.logger.Info("Successfully removed container", zap.String("containerID", id))
+	return nil
+}
+
+func (r *realDocker) ExecInContainer(ctx context.Context, id string, cmd []string, timeoutSeconds int) (string, string, int, error) {
+	r.logger.Info("Exec in container", zap.String("containerID", id), zap.Strings("cmd", cmd))
+
+	createOpts := docker.CreateExecOptions{
+		Container:    id,
+		Cmd:          cmd,
+		AttachStdout: true,
+		AttachStderr: true,
+		Tty:          false,
+	}
+
+	execObj, err := r.client.CreateExec(createOpts)
+	if err != nil {
+		r.logger.Error("CreateExec failed", zap.String("containerID", id), zap.Error(err))
+		return "", "", -1, fmt.Errorf("create exec failed: %w", err)
+	}
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+
+	done := make(chan error, 1)
+	go func() {
+		startOpts := docker.StartExecOptions{
+			OutputStream: &stdoutBuf,
+			ErrorStream:  &stderrBuf,
+			RawTerminal:  false,
+		}
+		err := r.client.StartExec(execObj.ID, startOpts)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			r.logger.Error("StartExec error", zap.Error(err))
+			return "", "", -1, fmt.Errorf("start exec failed: %w", err)
+		}
+	case <-time.After(time.Duration(timeoutSeconds) * time.Second):
+		// Timeout: try to stop container to interrupt the exec
+		r.logger.Warn("Exec timeout reached, stopping container to interrupt", zap.String("containerID", id))
+		_ = r.client.StopContainer(id, 1)
+		// wait for start to finish
+		err := <-done
+		if err != nil {
+			r.logger.Error("StartExec after timeout returned error", zap.Error(err))
+		}
+	case <-ctx.Done():
+		return "", "", -1, ctx.Err()
+	}
+
+	// Inspect exec to find exit code
+	inspect, err := r.client.InspectExec(execObj.ID)
+	if err != nil {
+		r.logger.Error("InspectExec failed", zap.Error(err))
+		return stdoutBuf.String(), stderrBuf.String(), -1, fmt.Errorf("inspect exec failed: %w", err)
+	}
+
+	exitCode := inspect.ExitCode
+
+	r.logger.Info("Exec finished", zap.Int("exitCode", exitCode))
+	return stdoutBuf.String(), stderrBuf.String(), exitCode, nil
 }
 
 func (r *realDocker) ListRunnedContainers(ctx context.Context) ([]ContainerInspect, error) {

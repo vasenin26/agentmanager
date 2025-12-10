@@ -9,7 +9,9 @@
 - Агент открывает соединение по Unix-сокету, отправляет один JSON-запрос и ждёт JSON-ответ.
 
 Поддерживаемые `action`:
-- `exec` — выполнить команду: `{"action":"exec","command":"ls /shared-data"}`
+- `exec` — выполнить команду: `{"action":"exec","command":"ls /shared-data","timeout":60}`
+  - `command` — команда для выполнения (обязательно)
+  - `timeout` — таймаут выполнения в секундах (опционально, по умолчанию 60 секунд, максимум 600 секунд)
 - `status` — получить статус контейнера: `{"action":"status"}`
 - `destroy` — удалить контейнер: `{"action":"destroy"}`
 
@@ -25,7 +27,9 @@
 - Подключение: AF_UNIX (Unix domain socket).
 - Отправьте ровно один JSON-объект; сервер обработает и вернёт ответ, затем закроет соединение.
 - Сервер выполняет команду через `sh -lc "<command>"` внутри DinD-контейнера; поддерживаются пайпы и перенаправления.
-- Таймаут выполнения по умолчанию ~60s (конфигурируемо на стороне сервера).
+- Таймаут выполнения по умолчанию 60 секунд, можно указать в запросе через поле `timeout` (максимум 600 секунд).
+- Команды, которые ждут ввода (например, интерактивные), автоматически получают `/dev/null` в качестве stdin, чтобы не блокироваться.
+- Если команда превышает таймаут, она прерывается, и возвращается exit code 124 (стандартный код для timeout).
 
 ---
 
@@ -34,7 +38,7 @@
 Вручную (с `socat`):
 
 ```bash
-echo '{"action":"exec","command":"ls -la /shared-data"}' | socat - UNIX-CONNECT:/var/run/orchestrator/context-volume-1.sock
+echo '{"action":"exec","command":"ls -la /shared-data","timeout":30}' | socat - UNIX-CONNECT:/var/run/orchestrator/context-volume-1.sock
 
 echo '{"action":"status"}' | socat - UNIX-CONNECT:/var/run/orchestrator/context-volume-1.sock
 

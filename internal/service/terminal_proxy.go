@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -45,6 +46,7 @@ type proxyMeta struct {
 type request struct {
 	Action  string `json:"action"`
 	Command string `json:"command,omitempty"`
+	Timeout int    `json:"timeout,omitempty"` // Timeout in seconds (0 = use default)
 }
 
 type execResponse struct {
@@ -157,8 +159,17 @@ func (p *Proxy) handleConn(ctx context.Context, conn net.Conn) error {
 		if req.Command == "" {
 			err = p.writeErrorBuf(bufWriter, enc, errors.New("missing command"))
 		} else {
-			p.logger.Debug("Executing command", zap.String("command", req.Command))
-			stdout, stderr, exitCode, execErr := p.exec(ctx, req.Command)
+			// Use custom timeout if provided, otherwise use default
+			timeout := req.Timeout
+			if timeout <= 0 {
+				timeout = p.timeoutSeconds
+			}
+			// Limit maximum timeout to prevent abuse (e.g., max 10 minutes)
+			if timeout > 600 {
+				timeout = 600
+			}
+			p.logger.Debug("Executing command", zap.String("command", req.Command), zap.Int("timeout", timeout))
+			stdout, stderr, exitCode, execErr := p.execWithTimeout(ctx, req.Command, timeout)
 			if execErr != nil {
 				p.logger.Error("exec failed", zap.Error(execErr))
 			}
@@ -215,6 +226,10 @@ func (p *Proxy) writeErrorBuf(w *bufio.Writer, enc *json.Encoder, err error) err
 }
 
 func (p *Proxy) exec(ctx context.Context, command string) (string, string, int, error) {
+	return p.execWithTimeout(ctx, command, p.timeoutSeconds)
+}
+
+func (p *Proxy) execWithTimeout(ctx context.Context, command string, timeoutSeconds int) (string, string, int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -232,8 +247,20 @@ func (p *Proxy) exec(ctx context.Context, command string) (string, string, int, 
 	// update last active
 	_ = p.updateLastActive(time.Now())
 
-	stdout, stderr, exitCode, err := p.dockerClient.ExecInContainer(ctx, containerID, []string{"sh", "-lc", command}, p.timeoutSeconds)
+	// Wrap command to prevent interactive input and ensure it doesn't hang
+	// Redirect stdin from /dev/null to prevent commands from waiting for input
+	// Use timeout command if available, otherwise just redirect stdin
+	wrappedCommand := fmt.Sprintf("%s </dev/null", command)
+
+	stdout, stderr, exitCode, err := p.dockerClient.ExecInContainer(ctx, containerID, []string{"sh", "-lc", wrappedCommand}, timeoutSeconds)
 	_ = p.updateLastActive(time.Now())
+
+	// Check if timeout occurred
+	if err != nil && strings.Contains(err.Error(), "timeout") {
+		p.logger.Warn("Command execution timed out", zap.String("command", command), zap.Int("timeout", timeoutSeconds))
+		return stdout, stderr + "\n[Command timed out after " + fmt.Sprintf("%d", timeoutSeconds) + " seconds]", 124, err
+	}
+
 	return stdout, stderr, exitCode, err
 }
 

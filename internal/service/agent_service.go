@@ -16,7 +16,6 @@ type AgentService struct {
 	dc             docker.DockerClient
 	registry       docker.AuthConfig
 	defaultTimeout time.Duration
-	serverURL      string
 	// Agent configuration
 	apiHost       string
 	openaiModel   string
@@ -26,12 +25,11 @@ type AgentService struct {
 	gitUserEmail  string
 }
 
-func NewAgentService(dc docker.DockerClient, reg docker.AuthConfig, t time.Duration, serverURL string, apiHost, openaiModel, openaiApiKey, openaiApiHost, gitUserName, gitUserEmail string) *AgentService {
+func NewAgentService(dc docker.DockerClient, reg docker.AuthConfig, t time.Duration, apiHost, openaiModel, openaiApiKey, openaiApiHost, gitUserName, gitUserEmail string) *AgentService {
 	return &AgentService{
 		dc:             dc,
 		registry:       reg,
 		defaultTimeout: t,
-		serverURL:      serverURL,
 		apiHost:        apiHost,
 		openaiModel:    openaiModel,
 		openaiApiKey:   openaiApiKey,
@@ -139,7 +137,6 @@ func (as *AgentService) StartAgentForTask(
 	}
 
 	return models.AgentMeta{
-		Server:  as.serverURL,
 		AgentID: configOptions.AgentID.String(),
 	}, nil
 }

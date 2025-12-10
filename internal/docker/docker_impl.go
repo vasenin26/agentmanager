@@ -251,14 +251,16 @@ func (r *realDocker) ExecInContainer(ctx context.Context, id string, cmd []strin
 			return "", "", -1, fmt.Errorf("start exec failed: %w", err)
 		}
 	case <-time.After(time.Duration(timeoutSeconds) * time.Second):
-		// Timeout: try to stop container to interrupt the exec
-		r.logger.Warn("Exec timeout reached, stopping container to interrupt", zap.String("containerID", id))
-		_ = r.client.StopContainer(id, 1)
-		// wait for start to finish
-		err := <-done
-		if err != nil {
-			r.logger.Error("StartExec after timeout returned error", zap.Error(err))
+		// Timeout: exec process is still running, but we return timeout error
+		// The process will continue running in the background, but we won't wait for it
+		r.logger.Warn("Exec timeout reached", zap.String("containerID", id), zap.String("execID", execObj.ID), zap.Int("timeout", timeoutSeconds))
+		// Try to inspect to get current state
+		inspect, inspectErr := r.client.InspectExec(execObj.ID)
+		if inspectErr == nil {
+			r.logger.Debug("Exec state after timeout", zap.Bool("running", inspect.Running), zap.Int("exitCode", inspect.ExitCode))
 		}
+		// Return timeout error with what we have so far
+		return stdoutBuf.String(), stderrBuf.String() + "\n[Execution timed out after " + fmt.Sprintf("%d", timeoutSeconds) + " seconds]", 124, fmt.Errorf("execution timed out after %d seconds", timeoutSeconds)
 	case <-ctx.Done():
 		return "", "", -1, ctx.Err()
 	}

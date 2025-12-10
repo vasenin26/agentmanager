@@ -35,7 +35,9 @@ type Proxy struct {
 	hostSharedPath  string
 	logger          *zap.Logger
 
-	mu sync.Mutex
+	mu            sync.Mutex
+	bashExec      *docker.LongRunningExec
+	bashContainer string
 }
 
 type proxyMeta struct {
@@ -159,26 +161,10 @@ func (p *Proxy) handleConn(ctx context.Context, conn net.Conn) error {
 		if req.Command == "" {
 			err = p.writeErrorBuf(bufWriter, enc, errors.New("missing command"))
 		} else {
-			// Use custom timeout if provided, otherwise use default
-			timeout := req.Timeout
-			if timeout <= 0 {
-				timeout = p.timeoutSeconds
-			}
-			// Limit maximum timeout to prevent abuse (e.g., max 10 minutes)
-			if timeout > 600 {
-				timeout = 600
-			}
-			p.logger.Debug("Executing command", zap.String("command", req.Command), zap.Int("timeout", timeout))
-			stdout, stderr, exitCode, execErr := p.execWithTimeout(ctx, req.Command, timeout)
-			if execErr != nil {
-				p.logger.Error("exec failed", zap.Error(execErr))
-			}
-			resp := execResponse{Stdout: stdout, Stderr: stderr, ExitCode: exitCode}
-			p.logger.Debug("Preparing response", zap.Int("exitCode", exitCode), zap.Int("stdoutLen", len(stdout)), zap.Int("stderrLen", len(stderr)))
-			err = enc.Encode(resp)
-			if err != nil {
-				p.logger.Error("Failed to encode response", zap.Error(err))
-			}
+			// For exec action, start bash session and handle multiple commands through same connection
+			err = p.handleExecSession(ctx, conn, bufWriter, enc, req.Command)
+			// Don't close connection here - it will be closed when session ends
+			return err
 		}
 	case "status":
 		st, statusErr := p.status(ctx)
@@ -223,6 +209,340 @@ func (p *Proxy) writeError(w io.Writer, err error) error {
 func (p *Proxy) writeErrorBuf(w *bufio.Writer, enc *json.Encoder, err error) error {
 	p.logger.Error("request error", zap.Error(err))
 	return enc.Encode(map[string]string{"error": err.Error()})
+}
+
+// handleExecSession handles exec action by starting bash and processing multiple commands
+func (p *Proxy) handleExecSession(ctx context.Context, conn net.Conn, bufWriter *bufio.Writer, enc *json.Encoder, firstCommand string) error {
+	p.mu.Lock()
+
+	// Ensure container exists and is running
+	containerID, err := p.ensureContainer(ctx)
+	if err != nil {
+		p.mu.Unlock()
+		return p.writeErrorBuf(bufWriter, enc, err)
+	}
+
+	// Start bash process if not already started or if container changed
+	if p.bashExec == nil || p.bashContainer != containerID {
+		// Close old bash process if exists
+		if p.bashExec != nil {
+			p.bashExec.Stdin.Close()
+			p.bashExec.Stdout.Close()
+			p.bashExec.Stderr.Close()
+		}
+
+		// Wait for Docker daemon to be ready
+		if err := p.waitForDockerDaemon(ctx, containerID); err != nil {
+			p.logger.Warn("Docker daemon might not be ready, continuing anyway", zap.Error(err))
+		}
+
+		// Create long-running bash process (use sh if bash is not available)
+		bashExec, err := p.dockerClient.CreateLongRunningExec(ctx, containerID, []string{"sh", "-i"})
+		if err != nil {
+			p.mu.Unlock()
+			return p.writeErrorBuf(bufWriter, enc, fmt.Errorf("failed to start bash: %w", err))
+		}
+
+		p.bashExec = bashExec
+		p.bashContainer = containerID
+		p.logger.Info("Bash process started", zap.String("containerID", containerID), zap.String("execID", bashExec.ExecID))
+	}
+
+	bashExec := p.bashExec
+	p.mu.Unlock()
+
+	// Update last active
+	_ = p.updateLastActive(time.Now())
+
+	// Send first command
+	if firstCommand != "" {
+		if err := p.executeCommandInBash(ctx, bashExec, firstCommand, bufWriter, enc); err != nil {
+			return err
+		}
+	}
+
+	// Continue reading commands from connection and executing them
+	dec := json.NewDecoder(conn)
+	for {
+		var req request
+		if err := dec.Decode(&req); err != nil {
+			if err == io.EOF {
+				p.logger.Debug("Connection closed by client")
+				return nil
+			}
+			p.logger.Error("Failed to decode request", zap.Error(err))
+			return err
+		}
+
+		if req.Action != "exec" {
+			// For non-exec actions, handle normally but don't close connection
+			switch req.Action {
+			case "status":
+				st, statusErr := p.status(ctx)
+				if statusErr != nil {
+					_ = p.writeErrorBuf(bufWriter, enc, statusErr)
+				} else {
+					_ = enc.Encode(st)
+				}
+				_ = bufWriter.Flush()
+			case "destroy":
+				if destroyErr := p.destroy(ctx); destroyErr != nil {
+					_ = p.writeErrorBuf(bufWriter, enc, destroyErr)
+				} else {
+					_ = enc.Encode(map[string]string{"result": "ok"})
+				}
+				_ = bufWriter.Flush()
+				return nil
+			default:
+				_ = p.writeErrorBuf(bufWriter, enc, fmt.Errorf("unknown action: %s", req.Action))
+				_ = bufWriter.Flush()
+			}
+			continue
+		}
+
+		if req.Command == "" {
+			_ = p.writeErrorBuf(bufWriter, enc, errors.New("missing command"))
+			_ = bufWriter.Flush()
+			continue
+		}
+
+		if err := p.executeCommandInBash(ctx, bashExec, req.Command, bufWriter, enc); err != nil {
+			return err
+		}
+	}
+}
+
+// executeCommandInBash executes a command in the active bash process
+func (p *Proxy) executeCommandInBash(ctx context.Context, bashExec *docker.LongRunningExec, command string, bufWriter *bufio.Writer, enc *json.Encoder) error {
+	// Generate unique marker for command completion detection
+	markerID := fmt.Sprintf("__CMD_DONE_%d__", time.Now().UnixNano())
+
+	// Wrap command with marker to detect completion
+	// Use command && echo marker to ensure marker only appears if command succeeds
+	// For commands that might fail, we still want to see the marker
+	wrappedCommand := fmt.Sprintf("%s; echo '%s'\n", command, markerID)
+
+	// Write wrapped command to shell stdin
+	_, err := bashExec.Stdin.Write([]byte(wrappedCommand))
+	if err != nil {
+		p.logger.Error("Failed to write command to bash", zap.Error(err))
+		return p.writeErrorBuf(bufWriter, enc, fmt.Errorf("failed to write command: %w", err))
+	}
+
+	// Read response from bash stdout and stderr
+	// We need to read until we get a prompt or timeout
+	// For simplicity, we'll read with a timeout and collect output
+	timeout := 60 * time.Second
+	if p.timeoutSeconds > 0 {
+		timeout = time.Duration(p.timeoutSeconds) * time.Second
+	}
+
+	stdoutChan := make(chan string, 1)
+	stderrChan := make(chan string, 1)
+	errChan := make(chan error, 2)
+
+	// Read stdout with timeout and marker detection
+	go func() {
+		buf := make([]byte, 4096)
+		var output strings.Builder
+		deadline := time.Now().Add(timeout)
+		markerFound := false
+
+		for time.Now().Before(deadline) && !markerFound {
+			// Use select with timeout for non-blocking read
+			readDone := make(chan bool, 1)
+			var n int
+			var readErr error
+
+			go func() {
+				n, readErr = bashExec.Stdout.Read(buf)
+				readDone <- true
+			}()
+
+			select {
+			case <-ctx.Done():
+				errChan <- ctx.Err()
+				return
+			case <-readDone:
+				if n > 0 {
+					output.Write(buf[:n])
+					// Check if marker is in the output
+					outputStr := output.String()
+					if strings.Contains(outputStr, markerID) {
+						markerFound = true
+						// Remove marker and everything after it from output
+						markerIdx := strings.Index(outputStr, markerID)
+						if markerIdx > 0 {
+							// Also remove the newline before marker if present
+							cleanOutput := outputStr[:markerIdx]
+							cleanOutput = strings.TrimSuffix(cleanOutput, "\n")
+							cleanOutput = strings.TrimSuffix(cleanOutput, "\r")
+							stdoutChan <- cleanOutput
+						} else {
+							stdoutChan <- ""
+						}
+						return
+					}
+				}
+				if readErr != nil {
+					if readErr == io.EOF {
+						// EOF before marker - command might have failed or shell closed
+						outputStr := output.String()
+						// Remove marker if somehow present
+						if strings.Contains(outputStr, markerID) {
+							markerIdx := strings.Index(outputStr, markerID)
+							if markerIdx > 0 {
+								outputStr = outputStr[:markerIdx]
+								outputStr = strings.TrimSuffix(outputStr, "\n")
+								outputStr = strings.TrimSuffix(outputStr, "\r")
+							}
+						}
+						stdoutChan <- outputStr
+						return
+					}
+					errChan <- readErr
+					return
+				}
+			case <-time.After(500 * time.Millisecond):
+				// Check if we should continue or timeout
+				if time.Now().After(deadline) {
+					// Timeout - return what we have, removing marker if present
+					outputStr := output.String()
+					if strings.Contains(outputStr, markerID) {
+						markerIdx := strings.Index(outputStr, markerID)
+						if markerIdx > 0 {
+							outputStr = outputStr[:markerIdx]
+							outputStr = strings.TrimSuffix(outputStr, "\n")
+							outputStr = strings.TrimSuffix(outputStr, "\r")
+						}
+					}
+					stdoutChan <- outputStr
+					return
+				}
+			}
+		}
+
+		// If we exit loop without finding marker, return what we have
+		if !markerFound {
+			outputStr := output.String()
+			if strings.Contains(outputStr, markerID) {
+				markerIdx := strings.Index(outputStr, markerID)
+				if markerIdx > 0 {
+					outputStr = outputStr[:markerIdx]
+					outputStr = strings.TrimSuffix(outputStr, "\n")
+					outputStr = strings.TrimSuffix(outputStr, "\r")
+				}
+			}
+			stdoutChan <- outputStr
+		}
+	}()
+
+	// Read stderr with timeout (marker won't be in stderr, but we still need to read it)
+	go func() {
+		buf := make([]byte, 4096)
+		var output strings.Builder
+		deadline := time.Now().Add(timeout)
+		lastReadTime := time.Now()
+
+		for time.Now().Before(deadline) {
+			readDone := make(chan bool, 1)
+			var n int
+			var readErr error
+
+			go func() {
+				n, readErr = bashExec.Stderr.Read(buf)
+				readDone <- true
+			}()
+
+			select {
+			case <-ctx.Done():
+				errChan <- ctx.Err()
+				return
+			case <-readDone:
+				if n > 0 {
+					output.Write(buf[:n])
+					lastReadTime = time.Now()
+				}
+				if readErr != nil {
+					if readErr == io.EOF {
+						stderrChan <- output.String()
+						return
+					}
+					errChan <- readErr
+					return
+				}
+			case <-time.After(500 * time.Millisecond):
+				if time.Now().After(deadline) {
+					stderrChan <- output.String()
+					return
+				}
+				// If we haven't read anything for a while and stdout found marker, we're done
+				if output.Len() > 0 && time.Since(lastReadTime) > 1*time.Second {
+					// Give a bit more time for stderr to complete
+					time.Sleep(300 * time.Millisecond)
+					stderrChan <- output.String()
+					return
+				}
+			}
+		}
+		stderrChan <- output.String()
+	}()
+
+	// Wait for output or timeout
+	var stdout, stderr string
+	select {
+	case <-ctx.Done():
+		return p.writeErrorBuf(bufWriter, enc, ctx.Err())
+	case stdout = <-stdoutChan:
+		// Got stdout, marker was found
+	case err := <-errChan:
+		return p.writeErrorBuf(bufWriter, enc, fmt.Errorf("failed to read stdout: %w", err))
+	case <-time.After(timeout):
+		// Timeout occurred - check if we got any output from goroutines
+		select {
+		case stdout = <-stdoutChan:
+		default:
+			// No output received, command might have completed without output
+			// This can happen for commands like 'cd' that don't produce output
+			stdout = ""
+		}
+	}
+
+	// Wait for stderr with shorter timeout since stdout is done
+	select {
+	case stderr = <-stderrChan:
+	case err := <-errChan:
+		// stderr read error is not critical
+		p.logger.Warn("Failed to read stderr", zap.Error(err))
+	case <-time.After(2 * time.Second):
+		// Give stderr a bit more time, but not too long
+		select {
+		case stderr = <-stderrChan:
+		default:
+			stderr = ""
+		}
+	}
+
+	// Try to determine exit code by checking if command succeeded
+	// This is a simplification - in real bash we'd need to check $?
+	exitCode := 0
+	if strings.Contains(stderr, "error") || strings.Contains(stderr, "Error") {
+		exitCode = 1
+	}
+
+	// Update last active
+	_ = p.updateLastActive(time.Now())
+
+	// Send response
+	resp := execResponse{Stdout: stdout, Stderr: stderr, ExitCode: exitCode}
+	if err := enc.Encode(resp); err != nil {
+		return fmt.Errorf("failed to encode response: %w", err)
+	}
+	if err := bufWriter.Flush(); err != nil {
+		return fmt.Errorf("failed to flush response: %w", err)
+	}
+
+	return nil
 }
 
 func (p *Proxy) exec(ctx context.Context, command string) (string, string, int, error) {

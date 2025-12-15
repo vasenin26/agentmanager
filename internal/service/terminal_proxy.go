@@ -152,7 +152,8 @@ func (p *Proxy) handleConn(ctx context.Context, conn net.Conn) error {
 	p.logger.Debug("Request decoded", zap.String("action", req.Action), zap.String("command", req.Command))
 
 	// Use buffered writer to ensure data is flushed before connection closes
-	bufWriter := bufio.NewWriter(conn)
+	// Use smaller buffer size (512 bytes) to ensure data is sent more frequently
+	bufWriter := bufio.NewWriterSize(conn, 512)
 	enc := json.NewEncoder(bufWriter)
 
 	var err error
@@ -256,7 +257,7 @@ func (p *Proxy) handleExecSession(ctx context.Context, conn net.Conn, bufWriter 
 
 	// Send first command
 	if firstCommand != "" {
-		if err := p.executeCommandInBash(ctx, bashExec, firstCommand, bufWriter, enc); err != nil {
+		if err := p.executeCommandInBash(ctx, bashExec, firstCommand, conn, bufWriter, enc); err != nil {
 			return err
 		}
 	}
@@ -306,14 +307,14 @@ func (p *Proxy) handleExecSession(ctx context.Context, conn net.Conn, bufWriter 
 			continue
 		}
 
-		if err := p.executeCommandInBash(ctx, bashExec, req.Command, bufWriter, enc); err != nil {
+		if err := p.executeCommandInBash(ctx, bashExec, req.Command, conn, bufWriter, enc); err != nil {
 			return err
 		}
 	}
 }
 
 // executeCommandInBash executes a command in the active bash process
-func (p *Proxy) executeCommandInBash(ctx context.Context, bashExec *docker.LongRunningExec, command string, bufWriter *bufio.Writer, enc *json.Encoder) error {
+func (p *Proxy) executeCommandInBash(ctx context.Context, bashExec *docker.LongRunningExec, command string, conn net.Conn, bufWriter *bufio.Writer, enc *json.Encoder) error {
 	// Generate unique marker for command completion detection
 	markerID := fmt.Sprintf("__CMD_DONE_%d__", time.Now().UnixNano())
 
@@ -322,12 +323,15 @@ func (p *Proxy) executeCommandInBash(ctx context.Context, bashExec *docker.LongR
 	// For commands that might fail, we still want to see the marker
 	wrappedCommand := fmt.Sprintf("%s; echo '%s'\n", command, markerID)
 
+
 	// Write wrapped command to shell stdin
+	p.logger.Debug("Writing command to bash", zap.String("command", command), zap.String("markerID", markerID))
 	_, err := bashExec.Stdin.Write([]byte(wrappedCommand))
 	if err != nil {
 		p.logger.Error("Failed to write command to bash", zap.Error(err))
 		return p.writeErrorBuf(bufWriter, enc, fmt.Errorf("failed to write command: %w", err))
 	}
+	p.logger.Debug("Command written to bash, waiting for output", zap.String("command", command))
 
 	// Read response from bash stdout and stderr
 	// We need to read until we get a prompt or timeout
@@ -377,29 +381,32 @@ func (p *Proxy) executeCommandInBash(ctx context.Context, bashExec *docker.LongR
 							cleanOutput := outputStr[:markerIdx]
 							cleanOutput = strings.TrimSuffix(cleanOutput, "\n")
 							cleanOutput = strings.TrimSuffix(cleanOutput, "\r")
+							p.logger.Debug("Marker found in stdout", zap.String("command", command), zap.String("outputLength", fmt.Sprintf("%d", len(cleanOutput))))
 							stdoutChan <- cleanOutput
 						} else {
+							p.logger.Debug("Marker found but at start of output", zap.String("command", command))
 							stdoutChan <- ""
 						}
 						return
 					}
 				}
 				if readErr != nil {
-					if readErr == io.EOF {
-						// EOF before marker - command might have failed or shell closed
-						outputStr := output.String()
-						// Remove marker if somehow present
-						if strings.Contains(outputStr, markerID) {
-							markerIdx := strings.Index(outputStr, markerID)
-							if markerIdx > 0 {
-								outputStr = outputStr[:markerIdx]
-								outputStr = strings.TrimSuffix(outputStr, "\n")
-								outputStr = strings.TrimSuffix(outputStr, "\r")
-							}
+				if readErr == io.EOF {
+					// EOF before marker - command might have failed or shell closed
+					outputStr := output.String()
+					// Remove marker if somehow present
+					if strings.Contains(outputStr, markerID) {
+						markerIdx := strings.Index(outputStr, markerID)
+						if markerIdx > 0 {
+							outputStr = outputStr[:markerIdx]
+							outputStr = strings.TrimSuffix(outputStr, "\n")
+							outputStr = strings.TrimSuffix(outputStr, "\r")
 						}
-						stdoutChan <- outputStr
-						return
 					}
+					p.logger.Warn("EOF received before marker found", zap.String("command", command), zap.String("outputLength", fmt.Sprintf("%d", len(outputStr))))
+					stdoutChan <- outputStr
+					return
+				}
 					errChan <- readErr
 					return
 				}
@@ -416,6 +423,7 @@ func (p *Proxy) executeCommandInBash(ctx context.Context, bashExec *docker.LongR
 							outputStr = strings.TrimSuffix(outputStr, "\r")
 						}
 					}
+					p.logger.Warn("Timeout reading stdout, returning partial output", zap.String("command", command), zap.String("outputLength", fmt.Sprintf("%d", len(outputStr))))
 					stdoutChan <- outputStr
 					return
 				}
@@ -433,6 +441,7 @@ func (p *Proxy) executeCommandInBash(ctx context.Context, bashExec *docker.LongR
 					outputStr = strings.TrimSuffix(outputStr, "\r")
 				}
 			}
+			p.logger.Warn("Marker not found in stdout, returning partial output", zap.String("command", command), zap.String("outputLength", fmt.Sprintf("%d", len(outputStr))))
 			stdoutChan <- outputStr
 		}
 	}()
@@ -492,18 +501,24 @@ func (p *Proxy) executeCommandInBash(ctx context.Context, bashExec *docker.LongR
 	var stdout, stderr string
 	select {
 	case <-ctx.Done():
+		p.logger.Warn("Context cancelled while waiting for command output", zap.String("command", command))
 		return p.writeErrorBuf(bufWriter, enc, ctx.Err())
 	case stdout = <-stdoutChan:
 		// Got stdout, marker was found
+		p.logger.Debug("Received stdout from command", zap.String("command", command), zap.String("stdoutLength", fmt.Sprintf("%d", len(stdout))))
 	case err := <-errChan:
+		p.logger.Error("Error reading stdout", zap.String("command", command), zap.Error(err))
 		return p.writeErrorBuf(bufWriter, enc, fmt.Errorf("failed to read stdout: %w", err))
 	case <-time.After(timeout):
 		// Timeout occurred - check if we got any output from goroutines
+		p.logger.Warn("Timeout waiting for command output", zap.String("command", command), zap.Duration("timeout", timeout))
 		select {
 		case stdout = <-stdoutChan:
+			p.logger.Debug("Received stdout after timeout", zap.String("command", command), zap.String("stdoutLength", fmt.Sprintf("%d", len(stdout))))
 		default:
 			// No output received, command might have completed without output
 			// This can happen for commands like 'cd' that don't produce output
+			p.logger.Debug("No stdout received, command may have no output", zap.String("command", command))
 			stdout = ""
 		}
 	}
@@ -534,13 +549,34 @@ func (p *Proxy) executeCommandInBash(ctx context.Context, bashExec *docker.LongR
 	_ = p.updateLastActive(time.Now())
 
 	// Send response
+	p.logger.Debug("Preparing to send response", zap.String("command", command), zap.String("stdoutLength", fmt.Sprintf("%d", len(stdout))), zap.String("stderrLength", fmt.Sprintf("%d", len(stderr))), zap.Int("exitCode", exitCode))
 	resp := execResponse{Stdout: stdout, Stderr: stderr, ExitCode: exitCode}
-	if err := enc.Encode(resp); err != nil {
-		return fmt.Errorf("failed to encode response: %w", err)
+	
+	// Serialize response to JSON bytes
+	respBytes, err := json.Marshal(resp)
+	if err != nil {
+		p.logger.Error("Failed to marshal response", zap.String("command", command), zap.Error(err))
+		return fmt.Errorf("failed to marshal response: %w", err)
 	}
-	if err := bufWriter.Flush(); err != nil {
-		return fmt.Errorf("failed to flush response: %w", err)
+	// Add newline to match json.Encoder behavior
+	respBytes = append(respBytes, '\n')
+	
+	// Write response directly to connection using conn.Write()
+	// This bypasses all buffers and writes directly to the socket
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	n, err := conn.Write(respBytes)
+	conn.SetWriteDeadline(time.Time{}) // Clear deadline
+	
+	if err != nil {
+		p.logger.Error("Failed to write response to connection", zap.String("command", command), zap.Error(err), zap.Int("bytesWritten", n), zap.Int("totalBytes", len(respBytes)))
+		return fmt.Errorf("failed to write response: %w", err)
 	}
+	
+	if n != len(respBytes) {
+		p.logger.Warn("Partial write to connection", zap.String("command", command), zap.Int("bytesWritten", n), zap.Int("totalBytes", len(respBytes)))
+	}
+	
+	p.logger.Info("Command executed and response sent successfully", zap.String("command", command), zap.String("stdoutLength", fmt.Sprintf("%d", len(stdout))), zap.Int("exitCode", exitCode), zap.Int("bytesWritten", n))
 
 	return nil
 }

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"time"
 
@@ -9,11 +10,12 @@ import (
 	"github.com/vasenin26/agentmanager/internal/models"
 )
 
+const internalSocketPath = "/opt/terminal.sock"
+
 type AgentService struct {
 	dc             docker.DockerClient
 	registry       docker.AuthConfig
 	defaultTimeout time.Duration
-	serverURL      string
 	// Agent configuration
 	apiHost       string
 	openaiModel   string
@@ -23,12 +25,11 @@ type AgentService struct {
 	gitUserEmail  string
 }
 
-func NewAgentService(dc docker.DockerClient, reg docker.AuthConfig, t time.Duration, serverURL string, apiHost, openaiModel, openaiApiKey, openaiApiHost, gitUserName, gitUserEmail string) *AgentService {
+func NewAgentService(dc docker.DockerClient, reg docker.AuthConfig, t time.Duration, apiHost, openaiModel, openaiApiKey, openaiApiHost, gitUserName, gitUserEmail string) *AgentService {
 	return &AgentService{
 		dc:             dc,
 		registry:       reg,
 		defaultTimeout: t,
-		serverURL:      serverURL,
 		apiHost:        apiHost,
 		openaiModel:    openaiModel,
 		openaiApiKey:   openaiApiKey,
@@ -70,6 +71,16 @@ func (as *AgentService) StartAgentForTask(
 			VolumeID:  *contextVolumeID,
 			MountPath: "/home/local/context",
 		})
+		// Mount command proxy socket file for this specific context
+		// Use same socket directory as in NewProxy
+		socketDir := os.Getenv("ORCHESTRATOR_SOCKET_DIR")
+		if socketDir == "" {
+			socketDir = "/tmp/orchestrator"
+		}
+		volumes = append(volumes, docker.VolumeMount{
+			VolumeID:  fmt.Sprintf("%s/%s.sock", socketDir, *contextVolumeID),
+			MountPath: internalSocketPath,
+		})
 	}
 
 	// Create container config
@@ -97,6 +108,12 @@ func (as *AgentService) StartAgentForTask(
 		env["OPENAI_API_HOST"] = as.openaiApiHost
 	}
 
+	// If agent has a context volume, provide the command-proxy socket path for that context
+	// Socket is mounted at /opt/terminal inside the agent container
+	if contextVolumeID != nil {
+		env["COMMAND_PROXY_SOCKET"] = internalSocketPath
+	}
+
 	// Check AUTO_REMOVE_AGENT_CONTANERS environment variable
 	// Default is true (auto-remove enabled), can be disabled with "false" or "0"
 	autoRemove := os.Getenv("AUTO_REMOVE_AGENT_CONTANERS")
@@ -120,7 +137,6 @@ func (as *AgentService) StartAgentForTask(
 	}
 
 	return models.AgentMeta{
-		Server:  as.serverURL,
 		AgentID: configOptions.AgentID.String(),
 	}, nil
 }

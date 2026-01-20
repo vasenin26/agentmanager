@@ -25,6 +25,7 @@ services:
       - AGENT_API_TOKEN=${AGENT_API_TOKEN}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/orchestrator:/tmp/orchestrator
       - ssh_keys:/app/keys
       - orchestrator_data:/app/data
     ports:

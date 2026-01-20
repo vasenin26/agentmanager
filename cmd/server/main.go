@@ -46,8 +46,7 @@ func main() {
 	}()
 
 	reg := docker.AuthConfig{Server: cfg.RegistryServer, Username: cfg.RegistryUsername, Password: cfg.RegistryPassword}
-	serverURL := fmt.Sprintf("http://localhost:%s", cfg.HTTPPort)
-	agentSvc := service.NewAgentService(dc, reg, cfg.DefaultTimeout, serverURL,
+	agentSvc := service.NewAgentService(dc, reg, cfg.DefaultTimeout,
 		cfg.APIHost, cfg.OpenAIModel, cfg.OpenAIAPIKey, cfg.OpenAIApiHost, cfg.GitUserName, cfg.GitUserEmail)
 
 	// Orchestrator (всегда включен)
@@ -118,6 +117,7 @@ func main() {
 			projectKeyManager, // Управление SSH ключами проектов
 			cfg.TaskAPIToken,
 			cfg.TaskPollInterval,
+			reg, // Registry config for pulling DinD images
 			l,
 		)
 

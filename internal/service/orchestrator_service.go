@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	osfile "os"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,7 @@ type OrchestratorService struct {
 	agentService      *AgentService
 	projectKeyManager *ssh.ProjectKeyManager // Управление SSH ключами проектов
 	agentAPIToken     string                 // Общий токен для всех агентов
+	registry          docker.AuthConfig      // Registry config for pulling images
 	logger            *zap.Logger
 
 	// Управление жизненным циклом
@@ -35,6 +37,10 @@ type OrchestratorService struct {
 	wg           sync.WaitGroup
 	pollInterval time.Duration
 	mu           sync.Mutex
+	// Command proxy instances per context volumeID
+	proxies      map[string]*Proxy
+	proxiesMu    sync.Mutex
+	proxyCancels map[string]context.CancelFunc
 }
 
 func NewOrchestratorService(
@@ -48,6 +54,7 @@ func NewOrchestratorService(
 	projectKeyManager *ssh.ProjectKeyManager,
 	agentAPIToken string,
 	pollInterval time.Duration,
+	registry docker.AuthConfig,
 	logger *zap.Logger,
 ) *OrchestratorService {
 	return &OrchestratorService{
@@ -60,9 +67,12 @@ func NewOrchestratorService(
 		agentService:      agentService,
 		projectKeyManager: projectKeyManager,
 		agentAPIToken:     agentAPIToken,
+		registry:          registry,
 		logger:            logger,
 		stopChan:          make(chan struct{}),
 		pollInterval:      pollInterval,
+		proxies:           make(map[string]*Proxy),
+		proxyCancels:      make(map[string]context.CancelFunc),
 	}
 }
 
@@ -373,6 +383,20 @@ func (os *OrchestratorService) startAgentForTask(ctx context.Context, task *mode
 		if err := os.contextService.OccupyContext(ctx, contextDTO.ID, task.AgentUUID); err != nil {
 			return fmt.Errorf("failed to occupy context: %w", err)
 		}
+		// Ensure command proxy is running for this context volume (use 'docker:dind' image)
+		dindImage := "docker:dind"
+		// start proxy keyed by volumeID so socket name matches volume
+		go os.getOrStartProxy(contextDTO.VolumeID, dindImage)
+		// Wait for socket to be created before starting agent (needed for bind mount)
+		// Use same socket directory as in NewProxy
+		socketDirEnv := osfile.Getenv("ORCHESTRATOR_SOCKET_DIR")
+		if socketDirEnv == "" {
+			socketDirEnv = "/tmp/orchestrator"
+		}
+		socketPath := fmt.Sprintf("%s/%s.sock", socketDirEnv, contextDTO.VolumeID)
+		if err := os.waitForSocket(ctx, socketPath, 5*time.Second); err != nil {
+			os.logger.Warn("Socket not ready, agent may fail to mount socket", zap.String("socket", socketPath), zap.Error(err))
+		}
 	}
 
 	// Получить лимит памяти
@@ -605,6 +629,18 @@ func (os *OrchestratorService) listenDockerEvents(ctx context.Context) {
 			// Обрабатываем только событие "die". Docker также генерирует "stop",
 			// что приводило к двойной обработке и двойному декременту метрик.
 			if event.Status == "die" {
+				// Check if this container is an agent (not a DinD container)
+				// by checking if agent state exists for this container
+				_, err := os.agentStateStorage.GetAgentStateByContainerID(ctx, event.ContainerID)
+				if err != nil {
+					// Not an agent container (e.g., DinD container), ignore the event
+					os.logger.Debug("Ignoring Docker event for non-agent container",
+						zap.String("containerID", event.ContainerID),
+						zap.String("status", event.Status))
+					continue
+				}
+
+				// This is an agent container, process the event
 				if event.ExitCode == 0 {
 					// Успешное завершение
 					go os.handleAgentCompletion(context.Background(), event.ContainerID)
@@ -612,6 +648,68 @@ func (os *OrchestratorService) listenDockerEvents(ctx context.Context) {
 					// Сбой
 					go os.handleAgentFailure(context.Background(), event.ContainerID)
 				}
+			}
+		}
+	}
+}
+
+// getOrStartProxy ensures a command proxy exists for given volumeID and starts it if necessary.
+func (os *OrchestratorService) getOrStartProxy(volumeID, image string) *Proxy {
+	os.proxiesMu.Lock()
+	defer os.proxiesMu.Unlock()
+
+	if p, ok := os.proxies[volumeID]; ok {
+		return p
+	}
+
+	// Create and start proxy
+	p := NewProxy(volumeID, os.dockerClient, image, volumeID, os.registry, os.logger)
+	ctx, cancel := context.WithCancel(context.Background())
+	os.proxyCancels[volumeID] = cancel
+	os.proxies[volumeID] = p
+
+	go func() {
+		if err := p.Serve(ctx); err != nil {
+			os.logger.Error("command proxy serve error", zap.String("volumeID", volumeID), zap.Error(err))
+		}
+	}()
+
+	return p
+}
+
+// stopProxy stops and removes proxy for the given volumeID
+func (os *OrchestratorService) stopProxy(volumeID string) {
+	os.proxiesMu.Lock()
+	defer os.proxiesMu.Unlock()
+
+	if cancel, ok := os.proxyCancels[volumeID]; ok {
+		cancel()
+		delete(os.proxyCancels, volumeID)
+	}
+	if p, ok := os.proxies[volumeID]; ok {
+		// attempt to destroy underlying container
+		_ = p.destroy(context.Background())
+		delete(os.proxies, volumeID)
+	}
+}
+
+// waitForSocket waits for a socket file to be created, checking periodically
+func (o *OrchestratorService) waitForSocket(ctx context.Context, socketPath string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if _, err := osfile.Stat(socketPath); err == nil {
+				// Socket exists
+				return nil
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf("timeout waiting for socket: %s", socketPath)
 			}
 		}
 	}

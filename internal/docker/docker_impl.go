@@ -1,11 +1,13 @@
 package docker
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	docker "github.com/fsouza/go-dockerclient"
 	"go.uber.org/zap"
@@ -107,6 +109,7 @@ func (r *realDocker) CreateContainer(ctx context.Context, cfg ContainerConfig) (
 		AutoRemove: cfg.AutoRemove,
 		Memory:     cfg.MemoryLimit,
 		Binds:      binds,
+		Privileged: cfg.Privileged,
 	}
 
 	created, err := r.client.CreateContainer(docker.CreateContainerOptions{
@@ -196,6 +199,139 @@ func (r *realDocker) Close() error {
 		return nil
 	}
 	return nil
+}
+
+func (r *realDocker) RemoveContainer(ctx context.Context, id string) error {
+	r.logger.Info("Removing container", zap.String("containerID", id))
+
+	err := r.client.RemoveContainer(docker.RemoveContainerOptions{ID: id, Force: true, RemoveVolumes: false})
+	if err != nil {
+		r.logger.Error("Failed to remove container", zap.String("containerID", id), zap.Error(err))
+		return fmt.Errorf("failed to remove container %s: %w", id, err)
+	}
+
+	r.logger.Info("Successfully removed container", zap.String("containerID", id))
+	return nil
+}
+
+func (r *realDocker) ExecInContainer(ctx context.Context, id string, cmd []string, timeoutSeconds int) (string, string, int, error) {
+	r.logger.Info("Exec in container", zap.String("containerID", id), zap.Strings("cmd", cmd))
+
+	createOpts := docker.CreateExecOptions{
+		Container:    id,
+		Cmd:          cmd,
+		AttachStdout: true,
+		AttachStderr: true,
+		Tty:          false,
+	}
+
+	execObj, err := r.client.CreateExec(createOpts)
+	if err != nil {
+		r.logger.Error("CreateExec failed", zap.String("containerID", id), zap.Error(err))
+		return "", "", -1, fmt.Errorf("create exec failed: %w", err)
+	}
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+
+	done := make(chan error, 1)
+	go func() {
+		startOpts := docker.StartExecOptions{
+			OutputStream: &stdoutBuf,
+			ErrorStream:  &stderrBuf,
+			RawTerminal:  false,
+		}
+		err := r.client.StartExec(execObj.ID, startOpts)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			r.logger.Error("StartExec error", zap.Error(err))
+			return "", "", -1, fmt.Errorf("start exec failed: %w", err)
+		}
+	case <-time.After(time.Duration(timeoutSeconds) * time.Second):
+		// Timeout: exec process is still running, but we return timeout error
+		// The process will continue running in the background, but we won't wait for it
+		r.logger.Warn("Exec timeout reached", zap.String("containerID", id), zap.String("execID", execObj.ID), zap.Int("timeout", timeoutSeconds))
+		// Try to inspect to get current state
+		inspect, inspectErr := r.client.InspectExec(execObj.ID)
+		if inspectErr == nil {
+			r.logger.Debug("Exec state after timeout", zap.Bool("running", inspect.Running), zap.Int("exitCode", inspect.ExitCode))
+		}
+		// Return timeout error with what we have so far
+		return stdoutBuf.String(), stderrBuf.String() + "\n[Execution timed out after " + fmt.Sprintf("%d", timeoutSeconds) + " seconds]", 124, fmt.Errorf("execution timed out after %d seconds", timeoutSeconds)
+	case <-ctx.Done():
+		return "", "", -1, ctx.Err()
+	}
+
+	// Inspect exec to find exit code
+	inspect, err := r.client.InspectExec(execObj.ID)
+	if err != nil {
+		r.logger.Error("InspectExec failed", zap.Error(err))
+		return stdoutBuf.String(), stderrBuf.String(), -1, fmt.Errorf("inspect exec failed: %w", err)
+	}
+
+	exitCode := inspect.ExitCode
+
+	r.logger.Info("Exec finished", zap.Int("exitCode", exitCode))
+	return stdoutBuf.String(), stderrBuf.String(), exitCode, nil
+}
+
+func (r *realDocker) CreateLongRunningExec(ctx context.Context, id string, cmd []string) (*LongRunningExec, error) {
+	r.logger.Info("Create long-running exec in container", zap.String("containerID", id), zap.Strings("cmd", cmd))
+
+	createOpts := docker.CreateExecOptions{
+		Container:    id,
+		Cmd:          cmd,
+		AttachStdin:  true,
+		AttachStdout: true,
+		AttachStderr: true,
+		Tty:          false,
+	}
+
+	execObj, err := r.client.CreateExec(createOpts)
+	if err != nil {
+		r.logger.Error("CreateExec failed", zap.String("containerID", id), zap.Error(err))
+		return nil, fmt.Errorf("create exec failed: %w", err)
+	}
+
+	// Create pipes for stdin/stdout/stderr
+	stdinReader, stdinWriter := io.Pipe()
+	stdoutReader, stdoutWriter := io.Pipe()
+	stderrReader, stderrWriter := io.Pipe()
+
+	// Start the exec process with the pipes in a goroutine (StartExec blocks)
+	startOpts := docker.StartExecOptions{
+		InputStream:  stdinReader,
+		OutputStream: stdoutWriter,
+		ErrorStream:  stderrWriter,
+		RawTerminal:  false,
+	}
+
+	// Start exec in goroutine since it blocks until process completes
+	go func() {
+		err := r.client.StartExec(execObj.ID, startOpts)
+		if err != nil {
+			r.logger.Error("StartExec error in goroutine", zap.String("execID", execObj.ID), zap.Error(err))
+			// Close pipes on error
+			stdinReader.Close()
+			stdoutWriter.Close()
+			stderrWriter.Close()
+		} else {
+			// Close writer ends when exec completes
+			stdoutWriter.Close()
+			stderrWriter.Close()
+		}
+	}()
+
+	r.logger.Info("Long-running exec started", zap.String("execID", execObj.ID))
+	return &LongRunningExec{
+		Stdin:  stdinWriter,
+		Stdout: stdoutReader,
+		Stderr: stderrReader,
+		ExecID: execObj.ID,
+	}, nil
 }
 
 func (r *realDocker) ListRunnedContainers(ctx context.Context) ([]ContainerInspect, error) {

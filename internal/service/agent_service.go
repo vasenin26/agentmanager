@@ -114,17 +114,18 @@ func (as *AgentService) StartAgentForTask(
 		env["COMMAND_PROXY_SOCKET"] = internalSocketPath
 	}
 
-	// Check AUTO_REMOVE_AGENT_CONTANERS environment variable
-	// Default is true (auto-remove enabled), can be disabled with "false" or "0"
-	autoRemove := os.Getenv("AUTO_REMOVE_AGENT_CONTANERS")
-	autoRemoveEnabled := autoRemove != "false" && autoRemove != "0"
-
+	// Agent containers are removed by the orchestrator after a delay (see listenDockerEvents).
+	// Labels for Loki/indexing: keys with underscore, values as strings.
 	containerConfig := docker.ContainerConfig{
 		Image:       image,
 		MemoryLimit: memoryLimit,
 		Volumes:     volumes,
 		Env:         env,
-		AutoRemove:  autoRemoveEnabled,
+		Labels: map[string]string{
+			"ml_job_id":    taskID,
+			"ml_component": "agent",
+		},
+		AutoRemove: false,
 	}
 
 	containerID, err := as.dc.CreateContainer(ctx, containerConfig)

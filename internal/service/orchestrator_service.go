@@ -641,13 +641,23 @@ func (os *OrchestratorService) listenDockerEvents(ctx context.Context) {
 				}
 
 				// This is an agent container, process the event
+				containerID := event.ContainerID
 				if event.ExitCode == 0 {
 					// Успешное завершение
-					go os.handleAgentCompletion(context.Background(), event.ContainerID)
+					go os.handleAgentCompletion(context.Background(), containerID)
 				} else {
 					// Сбой
-					go os.handleAgentFailure(context.Background(), event.ContainerID)
+					go os.handleAgentFailure(context.Background(), containerID)
 				}
+				// Remove container after 3 minutes (container is already stopped after "die")
+				go func(cid string) {
+					time.Sleep(3 * time.Minute)
+					if err := os.dockerClient.RemoveContainer(context.Background(), cid); err != nil {
+						os.logger.Debug("Failed to remove agent container after timeout",
+							zap.String("containerID", cid),
+							zap.Error(err))
+					}
+				}(containerID)
 			}
 		}
 	}

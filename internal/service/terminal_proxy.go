@@ -702,6 +702,7 @@ func (p *Proxy) ensureContainer(ctx context.Context) (string, error) {
 		Volumes: []docker.VolumeMount{
 			{VolumeID: p.hostSharedPath, MountPath: "/opt/repos"},
 		},
+		Labels:     map[string]string{"ml_component": "proxy"},
 		AutoRemove: false,
 		Privileged: true, // DinD requires privileged mode
 	}

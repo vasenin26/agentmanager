@@ -19,10 +19,11 @@ type VolumeMount struct {
 type ContainerConfig struct {
 	Image       string
 	Env         map[string]string
-	MemoryLimit int64         // Лимит памяти в байтах
-	Volumes     []VolumeMount // Монтирование volumes
-	AutoRemove  bool          // Автоматическое удаление контейнера после остановки
-	Privileged  bool          // Привилегированный режим (нужен для DinD)
+	Labels      map[string]string // Опциональные лейблы контейнера (Loki и др.)
+	MemoryLimit int64             // Лимит памяти в байтах
+	Volumes     []VolumeMount     // Монтирование volumes
+	AutoRemove  bool              // Автоматическое удаление контейнера после остановки
+	Privileged  bool              // Привилегированный режим (нужен для DinD)
 }
 
 type ContainerInspect struct {

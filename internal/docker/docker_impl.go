@@ -102,8 +102,9 @@ func (r *realDocker) CreateContainer(ctx context.Context, cfg ContainerConfig) (
 	}
 
 	containerConfig := &docker.Config{
-		Image: cfg.Image,
-		Env:   env,
+		Image:  cfg.Image,
+		Env:    env,
+		Labels: cfg.Labels,
 	}
 	hostConfig := &docker.HostConfig{
 		AutoRemove: cfg.AutoRemove,

@@ -11,6 +11,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +20,71 @@ import (
 	"github.com/vasenin26/agentmanager/internal/docker"
 	"go.uber.org/zap"
 )
+
+// ansiEscape matches ANSI escape sequences (CSI, OSC, etc.) for stripping from PTY output.
+var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x1b]*\x1b\\|\x1b[=_P].*?\x1b\\`)
+
+// bashReader drains a stream into a buffered channel using a single persistent
+// goroutine. Prevents goroutine leaks between sequential commands.
+type bashReader struct {
+	ch  <-chan []byte // receives chunks as they arrive
+	buf []byte        // leftover bytes read past the marker of the previous command
+}
+
+func startBashReader(ctx context.Context, r io.Reader) *bashReader {
+	ch := make(chan []byte, 256)
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := r.Read(buf)
+			if n > 0 {
+				chunk := make([]byte, n)
+				copy(chunk, buf[:n])
+				select {
+				case ch <- chunk:
+				case <-ctx.Done():
+					return
+				}
+			}
+			if err != nil {
+				close(ch)
+				return
+			}
+		}
+	}()
+	return &bashReader{ch: ch}
+}
+
+// cleanPTYOutput strips ANSI escapes and keeps only actual command output (PTY echoes the command line).
+// Stream order: [prompt] [optional echoed input] [command stdout] [marker line]. We take content before the marker.
+func cleanPTYOutput(s, markerID string) string {
+	s = strings.ReplaceAll(s, "\r", "")
+	s = ansiEscape.ReplaceAllString(s, "")
+	lines := strings.Split(s, "\n")
+	// Find the marker line; keep only lines before it.
+	cut := len(lines)
+	for i, line := range lines {
+		if strings.Contains(line, markerID) {
+			cut = i
+			break
+		}
+	}
+	lines = lines[:cut]
+		// Drop lines that look like echoed command, prompt, or marker artifact (e.g. "0329705__:'$__x", literal \n).
+		var out []string
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" ||
+				trimmed == `\n` ||
+				strings.Contains(line, "; echo '") ||
+				strings.Contains(line, markerID) ||
+				strings.Contains(line, ":'$") {
+				continue
+			}
+			out = append(out, line)
+		}
+		return strings.TrimSpace(strings.Join(out, "\n"))
+}
 
 // Proxy provides a command proxy that listens on a Unix socket for JSON requests
 // and executes commands inside a DinD container. It manages container lifecycle
@@ -35,9 +102,13 @@ type Proxy struct {
 	hostSharedPath  string
 	logger          *zap.Logger
 
-	mu            sync.Mutex
-	bashExec      *docker.LongRunningExec
-	bashContainer string
+	mu                      sync.Mutex
+	bashExec                *docker.LongRunningExec
+	bashContainer           string
+	stdoutReader            *bashReader // session-level stdout reader
+	stderrReader            *bashReader // session-level stderr reader
+	useTty                  bool        // cached from env, set at session start
+	previousCommandTimedOut bool        // set when readUntilMarker times out; cleared before next command
 }
 
 type proxyMeta struct {
@@ -135,7 +206,11 @@ func (p *Proxy) Serve(ctx context.Context) error {
 				c.Close()
 			}()
 			if err := p.handleConn(ctx, c); err != nil {
-				p.logger.Error("handleConn error", zap.Error(err))
+				if err == io.EOF || strings.Contains(err.Error(), "EOF") {
+					p.logger.Debug("handleConn closed", zap.Error(err))
+				} else {
+					p.logger.Error("handleConn error", zap.Error(err))
+				}
 			}
 		}(conn)
 	}
@@ -146,7 +221,11 @@ func (p *Proxy) handleConn(ctx context.Context, conn net.Conn) error {
 	dec := json.NewDecoder(conn)
 	var req request
 	if err := dec.Decode(&req); err != nil {
-		p.logger.Error("Failed to decode request", zap.Error(err))
+		if err == io.EOF {
+			p.logger.Debug("Connection closed without request (e.g. socket probe)", zap.Error(err))
+		} else {
+			p.logger.Error("Failed to decode request", zap.Error(err))
+		}
 		return fmt.Errorf("decode request: %w", err)
 	}
 	p.logger.Debug("Request decoded", zap.String("action", req.Action), zap.String("command", req.Command))
@@ -237,8 +316,9 @@ func (p *Proxy) handleExecSession(ctx context.Context, conn net.Conn, bufWriter 
 			p.logger.Warn("Docker daemon might not be ready, continuing anyway", zap.Error(err))
 		}
 
-		// Create long-running bash process (use sh if bash is not available)
-		bashExec, err := p.dockerClient.CreateLongRunningExec(ctx, containerID, []string{"sh", "-i"})
+		// Create long-running shell with PTY so "sh -i" works without "can't access tty; job control turned off"
+		useTty := os.Getenv("DIND_USE_PTY") != "0" && strings.ToLower(strings.TrimSpace(os.Getenv("DIND_USE_PTY"))) != "false"
+		bashExec, err := p.dockerClient.CreateLongRunningExec(ctx, containerID, []string{"sh", "-i"}, useTty)
 		if err != nil {
 			p.mu.Unlock()
 			return p.writeErrorBuf(bufWriter, enc, fmt.Errorf("failed to start bash: %w", err))
@@ -246,6 +326,9 @@ func (p *Proxy) handleExecSession(ctx context.Context, conn net.Conn, bufWriter 
 
 		p.bashExec = bashExec
 		p.bashContainer = containerID
+		p.useTty = useTty
+		p.stdoutReader = startBashReader(ctx, bashExec.Stdout)
+		p.stderrReader = startBashReader(ctx, bashExec.Stderr)
 		p.logger.Info("Bash process started", zap.String("containerID", containerID), zap.String("execID", bashExec.ExecID))
 	}
 
@@ -313,272 +396,197 @@ func (p *Proxy) handleExecSession(ctx context.Context, conn net.Conn, bufWriter 
 	}
 }
 
+func stripAnsi(s string) string {
+	return strings.TrimSpace(ansiEscape.ReplaceAllString(strings.ReplaceAll(s, "\r", ""), ""))
+}
+
+func parseExitCode(s string) int {
+	s = strings.TrimPrefix(strings.TrimSpace(s), ":")
+	code, err := strconv.Atoi(s)
+	if err != nil {
+		return 0
+	}
+	return code
+}
+
+// cleanCommandOutput strips ANSI codes and (in PTY mode) removes echoed command line.
+func cleanCommandOutput(s, markerID string, useTty bool) string {
+	s = strings.ReplaceAll(s, "\r", "")
+	s = ansiEscape.ReplaceAllString(s, "")
+	s = strings.TrimSpace(s)
+	if useTty {
+		s = cleanPTYOutput(s, markerID)
+	}
+	return s
+}
+
+// readUntilMarker reads from r until markerID is found or timeout expires.
+// Returns cleaned output and exit code parsed from marker line ("MARKER:exitcode").
+// Any data after the marker line is saved in r.buf for the next command.
+func (p *Proxy) readUntilMarker(r *bashReader, markerID string, timeout time.Duration, ctx context.Context) (string, int) {
+	var acc strings.Builder
+	if len(r.buf) > 0 {
+		acc.Write(r.buf)
+		r.buf = nil
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		select {
+		case chunk, ok := <-r.ch:
+			if !ok {
+				return stripAnsi(acc.String()), -1
+			}
+			acc.Write(chunk)
+			s := acc.String()
+			// With PTY we output "\nMARKER:0" so the real marker line is uniquely "\n" + markerID + ":" + digit (echoed line has no leading \n before marker).
+			markerLineStart := "\n" + markerID + ":"
+			idx := -1
+			for pos := 0; ; {
+				i := strings.Index(s[pos:], markerLineStart)
+				if i < 0 {
+					break
+				}
+				candidate := pos + i
+				if candidate+len(markerLineStart) < len(s) && s[candidate+len(markerLineStart)] >= '0' && s[candidate+len(markerLineStart)] <= '9' {
+					idx = candidate
+					break
+				}
+				pos = candidate + 1
+			}
+			if idx < 0 {
+				// No PTY or legacy: match markerID + ":" + digit (e.g. "__CMD_DONE_xxx:0")
+				markerWithColon := markerID + ":"
+				for pos := 0; ; {
+					i := strings.Index(s[pos:], markerWithColon)
+					if i < 0 {
+						break
+					}
+					candidate := pos + i
+					if candidate+len(markerWithColon) < len(s) && s[candidate+len(markerWithColon)] >= '0' && s[candidate+len(markerWithColon)] <= '9' {
+						idx = candidate
+						markerLineStart = markerWithColon
+						break
+					}
+					pos = candidate + 1
+				}
+			}
+			if idx >= 0 {
+				output := s[:idx]
+				rest := s[idx+len(markerLineStart):]
+				nl := strings.IndexByte(rest, '\n')
+				exitCode := 0
+				if nl >= 0 {
+					exitCode = parseExitCode(rest[:nl])
+					r.buf = []byte(rest[nl+1:])
+				} else {
+					r.buf = []byte(rest)
+				}
+				return cleanCommandOutput(output, markerID, p.useTty), exitCode
+			}
+		case <-ctx.Done():
+			return stripAnsi(acc.String()), -1
+		case <-time.After(remaining):
+			// timeout
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+	}
+	return cleanCommandOutput(acc.String(), markerID, p.useTty), -1
+}
+
+// drainReader reads from r until 500ms of inactivity or maxWait expires.
+func (p *Proxy) drainReader(r *bashReader, maxWait time.Duration, ctx context.Context) string {
+	var acc strings.Builder
+	if len(r.buf) > 0 {
+		acc.Write(r.buf)
+		r.buf = nil
+	}
+	idle := time.NewTimer(500 * time.Millisecond)
+	defer idle.Stop()
+	deadline := time.Now().Add(maxWait)
+	for {
+		select {
+		case chunk, ok := <-r.ch:
+			if !ok {
+				return acc.String()
+			}
+			acc.Write(chunk)
+			idle.Reset(500 * time.Millisecond)
+		case <-idle.C:
+			return acc.String()
+		case <-ctx.Done():
+			return acc.String()
+		case <-time.After(time.Until(deadline)):
+			return acc.String()
+		}
+	}
+}
+
 // executeCommandInBash executes a command in the active bash process
 func (p *Proxy) executeCommandInBash(ctx context.Context, bashExec *docker.LongRunningExec, command string, conn net.Conn, bufWriter *bufio.Writer, enc *json.Encoder) error {
-	// Generate unique marker for command completion detection
+	// If previous command timed out, the shell may still be blocked on that foreground process.
+	// With PTY we free the console by sending Ctrl+Z (suspend) then "bg" so the job continues in background.
+	// Without PTY, Ctrl+Z does not send SIGTSTP; set DIND_USE_PTY=1 to enable freeing the console.
+	p.mu.Lock()
+	needFreeConsole := p.previousCommandTimedOut && p.useTty
+	if p.previousCommandTimedOut && !p.useTty {
+		p.logger.Debug("Previous command timed out; console not freed (requires DIND_USE_PTY=1)")
+	}
+	if p.previousCommandTimedOut {
+		p.previousCommandTimedOut = false
+	}
+	p.mu.Unlock()
+
+	if needFreeConsole {
+		if _, err := bashExec.Stdin.Write([]byte("\x1abg\n")); err != nil {
+			p.logger.Warn("Failed to send Ctrl+Z and bg to free console", zap.Error(err))
+		} else {
+			// Drain stdout briefly to clear shell messages (suspend/bg and prompt) before next command output
+			_ = p.drainReader(p.stdoutReader, 500*time.Millisecond, ctx)
+		}
+	}
+
 	markerID := fmt.Sprintf("__CMD_DONE_%d__", time.Now().UnixNano())
+	// Capture real exit code in marker line; leading \n so PTY stream has "\nMARKER:0" (never matches echoed command).
+	// With PTY, sleep 0.05s so command stdout is flushed before the marker line.
+	wrapped := fmt.Sprintf("%s; __x=$?; sleep 0.05 2>/dev/null || true; echo '\\n%s:'$__x\n", command, markerID)
 
-	// Wrap command with marker to detect completion
-	// Use command && echo marker to ensure marker only appears if command succeeds
-	// For commands that might fail, we still want to see the marker
-	wrappedCommand := fmt.Sprintf("%s; echo '%s'\n", command, markerID)
-
-
-	// Write wrapped command to shell stdin
 	p.logger.Debug("Writing command to bash", zap.String("command", command), zap.String("markerID", markerID))
-	_, err := bashExec.Stdin.Write([]byte(wrappedCommand))
-	if err != nil {
+	if _, err := bashExec.Stdin.Write([]byte(wrapped)); err != nil {
 		p.logger.Error("Failed to write command to bash", zap.Error(err))
-		return p.writeErrorBuf(bufWriter, enc, fmt.Errorf("failed to write command: %w", err))
-	}
-	p.logger.Debug("Command written to bash, waiting for output", zap.String("command", command))
-
-	// Read response from bash stdout and stderr
-	// We need to read until we get a prompt or timeout
-	// For simplicity, we'll read with a timeout and collect output
-	timeout := 60 * time.Second
-	if p.timeoutSeconds > 0 {
-		timeout = time.Duration(p.timeoutSeconds) * time.Second
+		return p.writeErrorBuf(bufWriter, enc, fmt.Errorf("write command: %w", err))
 	}
 
-	stdoutChan := make(chan string, 1)
-	stderrChan := make(chan string, 1)
-	errChan := make(chan error, 2)
+	timeout := time.Duration(p.timeoutSeconds) * time.Second
 
-	// Read stdout with timeout and marker detection
-	go func() {
-		buf := make([]byte, 4096)
-		var output strings.Builder
-		deadline := time.Now().Add(timeout)
-		markerFound := false
-
-		for time.Now().Before(deadline) && !markerFound {
-			// Use select with timeout for non-blocking read
-			readDone := make(chan bool, 1)
-			var n int
-			var readErr error
-
-			go func() {
-				n, readErr = bashExec.Stdout.Read(buf)
-				readDone <- true
-			}()
-
-			select {
-			case <-ctx.Done():
-				errChan <- ctx.Err()
-				return
-			case <-readDone:
-				if n > 0 {
-					output.Write(buf[:n])
-					// Check if marker is in the output
-					outputStr := output.String()
-					if strings.Contains(outputStr, markerID) {
-						markerFound = true
-						// Remove marker and everything after it from output
-						markerIdx := strings.Index(outputStr, markerID)
-						if markerIdx > 0 {
-							// Also remove the newline before marker if present
-							cleanOutput := outputStr[:markerIdx]
-							cleanOutput = strings.TrimSuffix(cleanOutput, "\n")
-							cleanOutput = strings.TrimSuffix(cleanOutput, "\r")
-							p.logger.Debug("Marker found in stdout", zap.String("command", command), zap.String("outputLength", fmt.Sprintf("%d", len(cleanOutput))))
-							stdoutChan <- cleanOutput
-						} else {
-							p.logger.Debug("Marker found but at start of output", zap.String("command", command))
-							stdoutChan <- ""
-						}
-						return
-					}
-				}
-				if readErr != nil {
-				if readErr == io.EOF {
-					// EOF before marker - command might have failed or shell closed
-					outputStr := output.String()
-					// Remove marker if somehow present
-					if strings.Contains(outputStr, markerID) {
-						markerIdx := strings.Index(outputStr, markerID)
-						if markerIdx > 0 {
-							outputStr = outputStr[:markerIdx]
-							outputStr = strings.TrimSuffix(outputStr, "\n")
-							outputStr = strings.TrimSuffix(outputStr, "\r")
-						}
-					}
-					p.logger.Warn("EOF received before marker found", zap.String("command", command), zap.String("outputLength", fmt.Sprintf("%d", len(outputStr))))
-					stdoutChan <- outputStr
-					return
-				}
-					errChan <- readErr
-					return
-				}
-			case <-time.After(500 * time.Millisecond):
-				// Check if we should continue or timeout
-				if time.Now().After(deadline) {
-					// Timeout - return what we have, removing marker if present
-					outputStr := output.String()
-					if strings.Contains(outputStr, markerID) {
-						markerIdx := strings.Index(outputStr, markerID)
-						if markerIdx > 0 {
-							outputStr = outputStr[:markerIdx]
-							outputStr = strings.TrimSuffix(outputStr, "\n")
-							outputStr = strings.TrimSuffix(outputStr, "\r")
-						}
-					}
-					p.logger.Warn("Timeout reading stdout, returning partial output", zap.String("command", command), zap.String("outputLength", fmt.Sprintf("%d", len(outputStr))))
-					stdoutChan <- outputStr
-					return
-				}
-			}
-		}
-
-		// If we exit loop without finding marker, return what we have
-		if !markerFound {
-			outputStr := output.String()
-			if strings.Contains(outputStr, markerID) {
-				markerIdx := strings.Index(outputStr, markerID)
-				if markerIdx > 0 {
-					outputStr = outputStr[:markerIdx]
-					outputStr = strings.TrimSuffix(outputStr, "\n")
-					outputStr = strings.TrimSuffix(outputStr, "\r")
-				}
-			}
-			p.logger.Warn("Marker not found in stdout, returning partial output", zap.String("command", command), zap.String("outputLength", fmt.Sprintf("%d", len(outputStr))))
-			stdoutChan <- outputStr
-		}
-	}()
-
-	// Read stderr with timeout (marker won't be in stderr, but we still need to read it)
-	go func() {
-		buf := make([]byte, 4096)
-		var output strings.Builder
-		deadline := time.Now().Add(timeout)
-		lastReadTime := time.Now()
-
-		for time.Now().Before(deadline) {
-			readDone := make(chan bool, 1)
-			var n int
-			var readErr error
-
-			go func() {
-				n, readErr = bashExec.Stderr.Read(buf)
-				readDone <- true
-			}()
-
-			select {
-			case <-ctx.Done():
-				errChan <- ctx.Err()
-				return
-			case <-readDone:
-				if n > 0 {
-					output.Write(buf[:n])
-					lastReadTime = time.Now()
-				}
-				if readErr != nil {
-					if readErr == io.EOF {
-						stderrChan <- output.String()
-						return
-					}
-					errChan <- readErr
-					return
-				}
-			case <-time.After(500 * time.Millisecond):
-				if time.Now().After(deadline) {
-					stderrChan <- output.String()
-					return
-				}
-				// If we haven't read anything for a while and stdout found marker, we're done
-				if output.Len() > 0 && time.Since(lastReadTime) > 1*time.Second {
-					// Give a bit more time for stderr to complete
-					time.Sleep(300 * time.Millisecond)
-					stderrChan <- output.String()
-					return
-				}
-			}
-		}
-		stderrChan <- output.String()
-	}()
-
-	// Wait for output or timeout
-	var stdout, stderr string
-	select {
-	case <-ctx.Done():
-		p.logger.Warn("Context cancelled while waiting for command output", zap.String("command", command))
-		return p.writeErrorBuf(bufWriter, enc, ctx.Err())
-	case stdout = <-stdoutChan:
-		// Got stdout, marker was found
-		p.logger.Debug("Received stdout from command", zap.String("command", command), zap.String("stdoutLength", fmt.Sprintf("%d", len(stdout))))
-	case err := <-errChan:
-		p.logger.Error("Error reading stdout", zap.String("command", command), zap.Error(err))
-		return p.writeErrorBuf(bufWriter, enc, fmt.Errorf("failed to read stdout: %w", err))
-	case <-time.After(timeout):
-		// Timeout occurred - check if we got any output from goroutines
-		p.logger.Warn("Timeout waiting for command output", zap.String("command", command), zap.Duration("timeout", timeout))
-		select {
-		case stdout = <-stdoutChan:
-			p.logger.Debug("Received stdout after timeout", zap.String("command", command), zap.String("stdoutLength", fmt.Sprintf("%d", len(stdout))))
-		default:
-			// No output received, command might have completed without output
-			// This can happen for commands like 'cd' that don't produce output
-			p.logger.Debug("No stdout received, command may have no output", zap.String("command", command))
-			stdout = ""
-		}
+	stdout, exitCode := p.readUntilMarker(p.stdoutReader, markerID, timeout, ctx)
+	if exitCode == -1 {
+		p.mu.Lock()
+		p.previousCommandTimedOut = true
+		p.mu.Unlock()
 	}
+	stderr := p.drainReader(p.stderrReader, 3*time.Second, ctx)
 
-	// Wait for stderr with shorter timeout since stdout is done
-	select {
-	case stderr = <-stderrChan:
-	case err := <-errChan:
-		// stderr read error is not critical
-		p.logger.Warn("Failed to read stderr", zap.Error(err))
-	case <-time.After(2 * time.Second):
-		// Give stderr a bit more time, but not too long
-		select {
-		case stderr = <-stderrChan:
-		default:
-			stderr = ""
-		}
-	}
-
-	// Try to determine exit code by checking if command succeeded
-	// This is a simplification - in real bash we'd need to check $?
-	exitCode := 0
-	if strings.Contains(stderr, "error") || strings.Contains(stderr, "Error") {
-		exitCode = 1
-	}
-
-	// Update last active
 	_ = p.updateLastActive(time.Now())
 
-	// Send response
-	p.logger.Debug("Preparing to send response", zap.String("command", command), zap.String("stdoutLength", fmt.Sprintf("%d", len(stdout))), zap.String("stderrLength", fmt.Sprintf("%d", len(stderr))), zap.Int("exitCode", exitCode))
+	p.logger.Info("Command executed", zap.String("command", command), zap.Int("stdout_len", len(stdout)), zap.Int("stderr_len", len(stderr)), zap.Int("exitCode", exitCode))
+
 	resp := execResponse{Stdout: stdout, Stderr: stderr, ExitCode: exitCode}
-	
-	// Serialize response to JSON bytes
 	respBytes, err := json.Marshal(resp)
 	if err != nil {
-		p.logger.Error("Failed to marshal response", zap.String("command", command), zap.Error(err))
-		return fmt.Errorf("failed to marshal response: %w", err)
+		return fmt.Errorf("marshal response: %w", err)
 	}
-	// Add newline to match json.Encoder behavior
 	respBytes = append(respBytes, '\n')
-	
-	// Write response directly to connection using conn.Write()
-	// This bypasses all buffers and writes directly to the socket
-	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	n, err := conn.Write(respBytes)
-	conn.SetWriteDeadline(time.Time{}) // Clear deadline
-	
-	if err != nil {
-		p.logger.Error("Failed to write response to connection", zap.String("command", command), zap.Error(err), zap.Int("bytesWritten", n), zap.Int("totalBytes", len(respBytes)))
-		return fmt.Errorf("failed to write response: %w", err)
-	}
-	
-	if n != len(respBytes) {
-		p.logger.Warn("Partial write to connection", zap.String("command", command), zap.Int("bytesWritten", n), zap.Int("totalBytes", len(respBytes)))
-	}
-	
-	p.logger.Info("Command executed and response sent successfully", zap.String("command", command), zap.String("stdoutLength", fmt.Sprintf("%d", len(stdout))), zap.Int("exitCode", exitCode), zap.Int("bytesWritten", n))
 
-	return nil
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	_, err = conn.Write(respBytes)
+	conn.SetWriteDeadline(time.Time{})
+	return err
 }
 
 func (p *Proxy) exec(ctx context.Context, command string) (string, string, int, error) {

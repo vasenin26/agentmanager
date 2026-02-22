@@ -54,8 +54,9 @@ type DockerClient interface {
 	RemoveContainer(ctx context.Context, id string) error
 	// ExecInContainer executes a command inside a container and returns stdout, stderr and exit code
 	ExecInContainer(ctx context.Context, id string, cmd []string, timeoutSeconds int) (string, string, int, error)
-	// CreateLongRunningExec creates a long-running exec process and returns stdin/stdout/stderr streams
-	CreateLongRunningExec(ctx context.Context, id string, cmd []string) (*LongRunningExec, error)
+	// CreateLongRunningExec creates a long-running exec process and returns stdin/stdout/stderr streams.
+	// When useTty is true, a PTY is used so child processes (e.g. docker compose) use line buffering; set DIND_USE_PTY=1 to enable.
+	CreateLongRunningExec(ctx context.Context, id string, cmd []string, useTty bool) (*LongRunningExec, error)
 	StartContainer(ctx context.Context, id string) error
 	StopContainer(ctx context.Context, id string) error
 	ListRunnedContainers(ctx context.Context) ([]ContainerInspect, error)

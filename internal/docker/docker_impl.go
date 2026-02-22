@@ -279,9 +279,21 @@ func (r *realDocker) ExecInContainer(ctx context.Context, id string, cmd []strin
 	return stdoutBuf.String(), stderrBuf.String(), exitCode, nil
 }
 
-func (r *realDocker) CreateLongRunningExec(ctx context.Context, id string, cmd []string) (*LongRunningExec, error) {
-	r.logger.Info("Create long-running exec in container", zap.String("containerID", id), zap.Strings("cmd", cmd))
+// emptyReadCloser is an io.ReadCloser that always returns EOF (used for Stderr when TTY is true).
+type emptyReadCloser struct{}
 
+func (emptyReadCloser) Read(p []byte) (int, error) { return 0, io.EOF }
+func (emptyReadCloser) Close() error              { return nil }
+
+func (r *realDocker) CreateLongRunningExec(ctx context.Context, id string, cmd []string, useTty bool) (*LongRunningExec, error) {
+	if useTty {
+		return r.createLongRunningExecPTY(ctx, id, cmd)
+	}
+	return r.createLongRunningExecNoTTY(ctx, id, cmd)
+}
+
+func (r *realDocker) createLongRunningExecNoTTY(ctx context.Context, id string, cmd []string) (*LongRunningExec, error) {
+	r.logger.Info("Create long-running exec in container", zap.String("containerID", id), zap.Strings("cmd", cmd))
 	createOpts := docker.CreateExecOptions{
 		Container:    id,
 		Cmd:          cmd,
@@ -290,47 +302,80 @@ func (r *realDocker) CreateLongRunningExec(ctx context.Context, id string, cmd [
 		AttachStderr: true,
 		Tty:          false,
 	}
-
 	execObj, err := r.client.CreateExec(createOpts)
 	if err != nil {
 		r.logger.Error("CreateExec failed", zap.String("containerID", id), zap.Error(err))
 		return nil, fmt.Errorf("create exec failed: %w", err)
 	}
-
-	// Create pipes for stdin/stdout/stderr
 	stdinReader, stdinWriter := io.Pipe()
 	stdoutReader, stdoutWriter := io.Pipe()
 	stderrReader, stderrWriter := io.Pipe()
-
-	// Start the exec process with the pipes in a goroutine (StartExec blocks)
 	startOpts := docker.StartExecOptions{
 		InputStream:  stdinReader,
 		OutputStream: stdoutWriter,
 		ErrorStream:  stderrWriter,
 		RawTerminal:  false,
 	}
-
-	// Start exec in goroutine since it blocks until process completes
 	go func() {
 		err := r.client.StartExec(execObj.ID, startOpts)
 		if err != nil {
 			r.logger.Error("StartExec error in goroutine", zap.String("execID", execObj.ID), zap.Error(err))
-			// Close pipes on error
 			stdinReader.Close()
 			stdoutWriter.Close()
 			stderrWriter.Close()
 		} else {
-			// Close writer ends when exec completes
 			stdoutWriter.Close()
 			stderrWriter.Close()
 		}
 	}()
-
 	r.logger.Info("Long-running exec started", zap.String("execID", execObj.ID))
 	return &LongRunningExec{
 		Stdin:  stdinWriter,
 		Stdout: stdoutReader,
 		Stderr: stderrReader,
+		ExecID: execObj.ID,
+	}, nil
+}
+
+func (r *realDocker) createLongRunningExecPTY(ctx context.Context, id string, cmd []string) (*LongRunningExec, error) {
+	r.logger.Info("Create long-running exec in container (PTY)", zap.String("containerID", id), zap.Strings("cmd", cmd))
+	createOpts := docker.CreateExecOptions{
+		Container:    id,
+		Cmd:          cmd,
+		AttachStdin:  true,
+		AttachStdout: true,
+		AttachStderr: false,
+		Tty:          true,
+	}
+	execObj, err := r.client.CreateExec(createOpts)
+	if err != nil {
+		r.logger.Error("CreateExec failed", zap.String("containerID", id), zap.Error(err))
+		return nil, fmt.Errorf("create exec failed: %w", err)
+	}
+	stdinReader, stdinWriter := io.Pipe()
+	stdoutReader, stdoutWriter := io.Pipe()
+	startOpts := docker.StartExecOptions{
+		InputStream:  stdinReader,
+		OutputStream: stdoutWriter,
+		ErrorStream:  io.Discard,
+		Tty:          true,
+		RawTerminal:  true,
+	}
+	go func() {
+		err := r.client.StartExec(execObj.ID, startOpts)
+		if err != nil {
+			r.logger.Error("StartExec error in goroutine", zap.String("execID", execObj.ID), zap.Error(err))
+			stdinReader.Close()
+			stdoutWriter.Close()
+		} else {
+			stdoutWriter.Close()
+		}
+	}()
+	r.logger.Info("Long-running exec started (PTY)", zap.String("execID", execObj.ID))
+	return &LongRunningExec{
+		Stdin:  stdinWriter,
+		Stdout: stdoutReader,
+		Stderr: emptyReadCloser{},
 		ExecID: execObj.ID,
 	}, nil
 }

@@ -20,6 +20,7 @@ type Config struct {
 	OpenAIModel   string
 	OpenAIAPIKey  string
 	OpenAIApiHost string
+	OpenAIProxy   string // HTTP-прокси для запросов агента к OpenAI
 	GitUserName   string
 	GitUserEmail  string
 
@@ -95,6 +96,7 @@ func Load() Config {
 		OpenAIModel:   os.Getenv("OPENAI_MODEL"),
 		OpenAIAPIKey:  os.Getenv("OPENAI_API_KEY"),
 		OpenAIApiHost: os.Getenv("OPENAI_API_HOST"),
+		OpenAIProxy:   os.Getenv("OPENAI_PROXY"),
 		GitUserName:   os.Getenv("GIT_USER_NAME"),
 		GitUserEmail:  os.Getenv("GIT_USER_EMAIL"),
 		// Orchestrator configuration

@@ -74,6 +74,8 @@ SSH ключи проектов сохраняются в файловой си�
 | `API_HOST` | Хост API | Из конфигурации |
 | `OPENAI_MODEL` | Модель OpenAI | Из конфигурации |
 | `OPENAI_API_KEY` | API ключ OpenAI | Из конфигурации |
+| `OPENAI_API_HOST` | OpenAI-совместимый endpoint (если задан) | Из конфигурации |
+| `OPENAI_PROXY` | HTTP-прокси для запросов к OpenAI (если задан) | Из конфигурации |
 | `GIT_USER_NAME` | Имя пользователя Git | Из конфигурации |
 | `GIT_USER_EMAIL` | Email пользователя Git | Из конфигурации |
 
@@ -264,6 +266,8 @@ curl -fsSL http://localhost:8080/metrics | head
 | **API Host** | `API_HOST` | - | Хост API для агентов |
 | **OpenAI Model** | `OPENAI_MODEL` | - | Модель OpenAI |
 | **OpenAI API Key** | `OPENAI_API_KEY` | - | API ключ OpenAI |
+| **OpenAI API Host** | `OPENAI_API_HOST` | - | OpenAI-совместимый endpoint, пусто = api.openai.com |
+| **OpenAI Proxy** | `OPENAI_PROXY` | - | HTTP-прокси агентов для запросов к OpenAI (`http://user:pass@host:3128`) |
 | **Git User Name** | `GIT_USER_NAME` | - | Имя пользователя Git |
 | **Git User Email** | `GIT_USER_EMAIL` | - | Email пользователя Git |
 | **SSH Keys Directory** | `SSH_KEYS_DIR` | `./keys` | Папка для хранения SSH ключей |

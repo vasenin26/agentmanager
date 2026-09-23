@@ -47,7 +47,7 @@ func main() {
 
 	reg := docker.AuthConfig{Server: cfg.RegistryServer, Username: cfg.RegistryUsername, Password: cfg.RegistryPassword}
 	agentSvc := service.NewAgentService(dc, reg, cfg.DefaultTimeout,
-		cfg.APIHost, cfg.OpenAIModel, cfg.OpenAIAPIKey, cfg.OpenAIApiHost, cfg.GitUserName, cfg.GitUserEmail)
+		cfg.APIHost, cfg.OpenAIModel, cfg.OpenAIAPIKey, cfg.OpenAIApiHost, cfg.OpenAIProxy, cfg.GitUserName, cfg.GitUserEmail)
 
 	// Orchestrator (всегда включен)
 	var orchestrator *service.OrchestratorService

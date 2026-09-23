@@ -21,11 +21,12 @@ type AgentService struct {
 	openaiModel   string
 	openaiApiKey  string
 	openaiApiHost string
+	openaiProxy   string
 	gitUserName   string
 	gitUserEmail  string
 }
 
-func NewAgentService(dc docker.DockerClient, reg docker.AuthConfig, t time.Duration, apiHost, openaiModel, openaiApiKey, openaiApiHost, gitUserName, gitUserEmail string) *AgentService {
+func NewAgentService(dc docker.DockerClient, reg docker.AuthConfig, t time.Duration, apiHost, openaiModel, openaiApiKey, openaiApiHost, openaiProxy, gitUserName, gitUserEmail string) *AgentService {
 	return &AgentService{
 		dc:             dc,
 		registry:       reg,
@@ -34,6 +35,7 @@ func NewAgentService(dc docker.DockerClient, reg docker.AuthConfig, t time.Durat
 		openaiModel:    openaiModel,
 		openaiApiKey:   openaiApiKey,
 		openaiApiHost:  openaiApiHost,
+		openaiProxy:    openaiProxy,
 		gitUserName:    gitUserName,
 		gitUserEmail:   gitUserEmail,
 	}
@@ -106,6 +108,11 @@ func (as *AgentService) StartAgentForTask(
 	// Add OPENAI_API_HOST if not empty
 	if as.openaiApiHost != "" {
 		env["OPENAI_API_HOST"] = as.openaiApiHost
+	}
+
+	// Add OPENAI_PROXY if not empty
+	if as.openaiProxy != "" {
+		env["OPENAI_PROXY"] = as.openaiProxy
 	}
 
 	// If agent has a context volume, provide the command-proxy socket path for that context

@@ -6,22 +6,23 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/vasenin26/agentmanager/internal/docker"
 	"go.uber.org/zap"
 )
 
-// Proxy provides a command proxy that listens on a Unix socket for JSON requests
-// and executes commands inside a DinD container. It manages container lifecycle
-// (start/stop/remove) and persists last activity metadata.
+// Proxy implements the Command Proxy protocol (agentmodule/docs/command-proxy-protocol.md):
+// it listens on a Unix socket for JSON requests and executes commands inside a DinD container.
+// It manages container lifecycle (start/stop/remove) and persists last activity metadata.
 type Proxy struct {
 	id              string
 	socketPath      string
@@ -35,9 +36,14 @@ type Proxy struct {
 	hostSharedPath  string
 	logger          *zap.Logger
 
-	mu            sync.Mutex
-	bashExec      *docker.LongRunningExec
-	bashContainer string
+	mu     sync.Mutex // guards the container lifecycle
+	metaMu sync.Mutex // guards read-modify-write of the meta file
+
+	jobsMu  sync.Mutex
+	jobs    map[string]*job
+	maxJobs int
+	jobsCtx context.Context // parent of all job contexts, cancelled when Serve stops
+	execs   atomic.Int32    // synchronous execs in progress
 }
 
 type proxyMeta struct {
@@ -45,9 +51,22 @@ type proxyMeta struct {
 	LastActiveAt time.Time `json:"last_active_at"`
 }
 
-type request struct {
-	Action  string `json:"action"`
-	Command string `json:"command,omitempty"`
+const (
+	execMaxTimeout     = 600 // seconds
+	requestReadTimeout = 10 * time.Second
+	responseTimeout    = 10 * time.Second
+)
+
+// Error codes of the protocol
+const (
+	errInvalidAction = "invalid_action"
+	errInvalidParams = "invalid_params"
+	errJobNotFound   = "job_not_found"
+	errProxyBusy     = "proxy_busy"
+)
+
+type execRequest struct {
+	Command string `json:"command"`
 	Timeout int    `json:"timeout,omitempty"` // Timeout in seconds (0 = use default)
 }
 
@@ -57,16 +76,54 @@ type execResponse struct {
 	ExitCode int    `json:"exit_code"`
 }
 
+type startRequest struct {
+	Command     *string           `json:"command"`
+	Cwd         string            `json:"cwd"`
+	Env         map[string]string `json:"env"`
+	MaxLifetime *int              `json:"max_lifetime"`
+}
+
+type pollRequest struct {
+	JobID        string `json:"job_id"`
+	Timeout      *int   `json:"timeout"`
+	StdoutOffset int64  `json:"stdout_offset"`
+	StderrOffset int64  `json:"stderr_offset"`
+}
+
+type killRequest struct {
+	JobID  string `json:"job_id"`
+	Signal string `json:"signal"`
+}
+
+type startResponse struct {
+	JobID string `json:"job_id"`
+}
+
+type killResponse struct {
+	JobID    string `json:"job_id"`
+	Status   string `json:"status"`
+	ExitCode *int   `json:"exit_code"`
+}
+
+type protocolError struct {
+	Code    string `json:"error"`
+	Message string `json:"message"`
+}
+
+func (e *protocolError) Error() string { return e.Code + ": " + e.Message }
+
+func newProtocolError(code, format string, args ...any) *protocolError {
+	return &protocolError{Code: code, Message: fmt.Sprintf(format, args...)}
+}
+
 type statusResponse struct {
 	ContainerID  string `json:"container_id,omitempty"`
 	State        string `json:"state,omitempty"`
 	LastActiveAt string `json:"last_active_at,omitempty"`
 }
 
-// NewProxy creates a new Proxy for a given logical ID. The socket will be created at /var/run/orchestrator/{id}.sock
-// image - DinD image to use; hostSharedPath - host path to bind into container at /shared-data
-// NewProxy creates a new Proxy for a given logical ID. The socket will be created at /var/run/orchestrator/{id}.sock
-// image - DinD image to use; hostVolumeID - docker volume name or host path to bind into container at /shared-data
+// NewProxy creates a new Proxy for a given logical ID. The socket will be created at {ORCHESTRATOR_SOCKET_DIR}/{id}.sock
+// image - DinD image to use; hostVolumeID - docker volume name or host path to bind into container at /opt/repos
 func NewProxy(id string, dc docker.DockerClient, image string, hostVolumeID string, registry docker.AuthConfig, logger *zap.Logger) *Proxy {
 	// Use configurable socket directory, default to /tmp/orchestrator for better Docker Desktop WSL2 compatibility
 	socketDir := os.Getenv("ORCHESTRATOR_SOCKET_DIR")
@@ -90,6 +147,9 @@ func NewProxy(id string, dc docker.DockerClient, image string, hostVolumeID stri
 		removalDuration: 7 * 24 * time.Hour,
 		hostSharedPath:  hostVolumeID,
 		logger:          logger,
+		jobs:            map[string]*job{},
+		maxJobs:         jobMaxConcurrent,
+		jobsCtx:         context.Background(),
 	}
 }
 
@@ -112,6 +172,16 @@ func (p *Proxy) Serve(ctx context.Context) error {
 	defer l.Close()
 	_ = os.Chmod(p.socketPath, 0o660)
 
+	p.jobsMu.Lock()
+	p.jobsCtx = ctx
+	p.jobsMu.Unlock()
+
+	// unblock Accept on shutdown
+	go func() {
+		<-ctx.Done()
+		_ = l.Close()
+	}()
+
 	// start background lifecycle manager
 	go p.lifecycleManager(ctx)
 
@@ -129,495 +199,282 @@ func (p *Proxy) Serve(ctx context.Context) error {
 			}
 		}
 		go func(c net.Conn) {
-			defer func() {
-				// Small delay to ensure data is sent before closing
-				time.Sleep(10 * time.Millisecond)
-				c.Close()
-			}()
-			if err := p.handleConn(ctx, c); err != nil {
-				p.logger.Error("handleConn error", zap.Error(err))
-			}
+			defer c.Close()
+			p.handleConn(ctx, c)
 		}(conn)
 	}
 }
 
-func (p *Proxy) handleConn(ctx context.Context, conn net.Conn) error {
-	p.logger.Debug("New connection accepted", zap.String("socket", p.socketPath))
-	dec := json.NewDecoder(conn)
-	var req request
-	if err := dec.Decode(&req); err != nil {
-		p.logger.Error("Failed to decode request", zap.Error(err))
-		return fmt.Errorf("decode request: %w", err)
-	}
-	p.logger.Debug("Request decoded", zap.String("action", req.Action), zap.String("command", req.Command))
+// handleConn serves exactly one request: reads one JSON document (a trailing delimiter is not
+// required), writes one "\n"-terminated JSON response and lets the caller close the connection.
+func (p *Proxy) handleConn(ctx context.Context, conn net.Conn) {
+	_ = conn.SetReadDeadline(time.Now().Add(requestReadTimeout))
+	var raw map[string]json.RawMessage
+	decodeErr := json.NewDecoder(conn).Decode(&raw)
+	_ = conn.SetReadDeadline(time.Time{})
 
-	// Use buffered writer to ensure data is flushed before connection closes
-	// Use smaller buffer size (512 bytes) to ensure data is sent more frequently
-	bufWriter := bufio.NewWriterSize(conn, 512)
-	enc := json.NewEncoder(bufWriter)
-
-	var err error
-	switch req.Action {
-	case "exec":
-		if req.Command == "" {
-			err = p.writeErrorBuf(bufWriter, enc, errors.New("missing command"))
-		} else {
-			// For exec action, start bash session and handle multiple commands through same connection
-			err = p.handleExecSession(ctx, conn, bufWriter, enc, req.Command)
-			// Don't close connection here - it will be closed when session ends
-			return err
-		}
-	case "status":
-		st, statusErr := p.status(ctx)
-		if statusErr != nil {
-			err = p.writeErrorBuf(bufWriter, enc, statusErr)
-		} else {
-			err = enc.Encode(st)
-		}
-	case "destroy":
-		if destroyErr := p.destroy(ctx); destroyErr != nil {
-			err = p.writeErrorBuf(bufWriter, enc, destroyErr)
-		} else {
-			err = enc.Encode(map[string]string{"result": "ok"})
-		}
-	default:
-		err = p.writeErrorBuf(bufWriter, enc, fmt.Errorf("unknown action: %s", req.Action))
+	var resp any
+	action := ""
+	if decodeErr != nil {
+		p.logger.Warn("Failed to decode request", zap.Error(decodeErr))
+		resp = newProtocolError(errInvalidParams, "malformed request: %v", decodeErr)
+	} else if rawAction, ok := raw["action"]; !ok || json.Unmarshal(rawAction, &action) != nil {
+		resp = newProtocolError(errInvalidAction, "field 'action' is required and must be a string")
+	} else {
+		resp = p.dispatch(ctx, action, raw)
 	}
 
-	// Flush buffered data before returning (connection will be closed by defer)
-	if err == nil {
-		err = bufWriter.Flush()
+	if perr, ok := resp.(*protocolError); ok {
+		p.logger.Warn("request error", zap.String("action", action), zap.String("code", perr.Code), zap.String("message", perr.Message))
+	}
+
+	w := bufio.NewWriter(conn)
+	_ = conn.SetWriteDeadline(time.Now().Add(responseTimeout))
+	if err := json.NewEncoder(w).Encode(resp); err == nil {
+		err = w.Flush()
 		if err != nil {
-			p.logger.Error("Failed to flush response", zap.Error(err))
-		} else {
-			p.logger.Info("Response sent successfully", zap.String("action", req.Action))
+			p.logger.Error("Failed to send response", zap.String("action", action), zap.Error(err))
 		}
 	} else {
-		p.logger.Error("Failed to send response", zap.Error(err), zap.String("action", req.Action))
-		// Try to send error response anyway
-		if encErr := p.writeErrorBuf(bufWriter, enc, err); encErr == nil {
-			_ = bufWriter.Flush()
-		}
+		p.logger.Error("Failed to encode response", zap.String("action", action), zap.Error(err))
 	}
-	return err
 }
 
-func (p *Proxy) writeError(w io.Writer, err error) error {
-	p.logger.Error("request error", zap.Error(err))
-	return json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-}
-
-func (p *Proxy) writeErrorBuf(w *bufio.Writer, enc *json.Encoder, err error) error {
-	p.logger.Error("request error", zap.Error(err))
-	return enc.Encode(map[string]string{"error": err.Error()})
-}
-
-// handleExecSession handles exec action by starting bash and processing multiple commands
-func (p *Proxy) handleExecSession(ctx context.Context, conn net.Conn, bufWriter *bufio.Writer, enc *json.Encoder, firstCommand string) error {
-	p.mu.Lock()
-
-	// Ensure container exists and is running
-	containerID, err := p.ensureContainer(ctx)
-	if err != nil {
-		p.mu.Unlock()
-		return p.writeErrorBuf(bufWriter, enc, err)
-	}
-
-	// Start bash process if not already started or if container changed
-	if p.bashExec == nil || p.bashContainer != containerID {
-		// Close old bash process if exists
-		if p.bashExec != nil {
-			p.bashExec.Stdin.Close()
-			p.bashExec.Stdout.Close()
-			p.bashExec.Stderr.Close()
+func (p *Proxy) dispatch(ctx context.Context, action string, raw map[string]json.RawMessage) any {
+	switch action {
+	case "exec":
+		// legacy flat error format {"error": "..."} is kept for exec
+		var req execRequest
+		if err := decodeParams(raw, &req); err != nil {
+			return map[string]string{"error": err.Error()}
 		}
-
-		// Wait for Docker daemon to be ready
-		if err := p.waitForDockerDaemon(ctx, containerID); err != nil {
-			p.logger.Warn("Docker daemon might not be ready, continuing anyway", zap.Error(err))
-		}
-
-		// Create long-running bash process (use sh if bash is not available)
-		bashExec, err := p.dockerClient.CreateLongRunningExec(ctx, containerID, []string{"sh", "-i"})
-		if err != nil {
-			p.mu.Unlock()
-			return p.writeErrorBuf(bufWriter, enc, fmt.Errorf("failed to start bash: %w", err))
-		}
-
-		p.bashExec = bashExec
-		p.bashContainer = containerID
-		p.logger.Info("Bash process started", zap.String("containerID", containerID), zap.String("execID", bashExec.ExecID))
-	}
-
-	bashExec := p.bashExec
-	p.mu.Unlock()
-
-	// Update last active
-	_ = p.updateLastActive(time.Now())
-
-	// Send first command
-	if firstCommand != "" {
-		if err := p.executeCommandInBash(ctx, bashExec, firstCommand, conn, bufWriter, enc); err != nil {
-			return err
-		}
-	}
-
-	// Continue reading commands from connection and executing them
-	dec := json.NewDecoder(conn)
-	for {
-		var req request
-		if err := dec.Decode(&req); err != nil {
-			if err == io.EOF {
-				p.logger.Debug("Connection closed by client")
-				return nil
-			}
-			p.logger.Error("Failed to decode request", zap.Error(err))
-			return err
-		}
-
-		if req.Action != "exec" {
-			// For non-exec actions, handle normally but don't close connection
-			switch req.Action {
-			case "status":
-				st, statusErr := p.status(ctx)
-				if statusErr != nil {
-					_ = p.writeErrorBuf(bufWriter, enc, statusErr)
-				} else {
-					_ = enc.Encode(st)
-				}
-				_ = bufWriter.Flush()
-			case "destroy":
-				if destroyErr := p.destroy(ctx); destroyErr != nil {
-					_ = p.writeErrorBuf(bufWriter, enc, destroyErr)
-				} else {
-					_ = enc.Encode(map[string]string{"result": "ok"})
-				}
-				_ = bufWriter.Flush()
-				return nil
-			default:
-				_ = p.writeErrorBuf(bufWriter, enc, fmt.Errorf("unknown action: %s", req.Action))
-				_ = bufWriter.Flush()
-			}
-			continue
-		}
-
 		if req.Command == "" {
-			_ = p.writeErrorBuf(bufWriter, enc, errors.New("missing command"))
-			_ = bufWriter.Flush()
-			continue
+			return map[string]string{"error": "missing command"}
 		}
-
-		if err := p.executeCommandInBash(ctx, bashExec, req.Command, conn, bufWriter, enc); err != nil {
-			return err
+		resp, err := p.exec(ctx, req.Command, req.Timeout)
+		if err != nil {
+			return map[string]string{"error": err.Error()}
 		}
+		return resp
+	case "start":
+		var req startRequest
+		if err := decodeParams(raw, &req); err != nil {
+			return newProtocolError(errInvalidParams, "%v", err)
+		}
+		return p.handleStart(req)
+	case "wait", "peek":
+		var req pollRequest
+		if err := decodeParams(raw, &req); err != nil {
+			return newProtocolError(errInvalidParams, "%v", err)
+		}
+		return p.handlePoll(ctx, req, action == "wait")
+	case "kill":
+		var req killRequest
+		if err := decodeParams(raw, &req); err != nil {
+			return newProtocolError(errInvalidParams, "%v", err)
+		}
+		return p.handleKill(ctx, req)
+	case "status":
+		st, err := p.status(ctx)
+		if err != nil {
+			return map[string]string{"error": err.Error()}
+		}
+		return st
+	case "destroy":
+		if err := p.destroy(ctx); err != nil {
+			return map[string]string{"error": err.Error()}
+		}
+		return map[string]string{"result": "ok"}
+	default:
+		return newProtocolError(errInvalidAction, "unknown action: %s", action)
 	}
 }
 
-// executeCommandInBash executes a command in the active bash process
-func (p *Proxy) executeCommandInBash(ctx context.Context, bashExec *docker.LongRunningExec, command string, conn net.Conn, bufWriter *bufio.Writer, enc *json.Encoder) error {
-	// Generate unique marker for command completion detection
-	markerID := fmt.Sprintf("__CMD_DONE_%d__", time.Now().UnixNano())
-
-	// Wrap command with marker to detect completion
-	// Use command && echo marker to ensure marker only appears if command succeeds
-	// For commands that might fail, we still want to see the marker
-	wrappedCommand := fmt.Sprintf("%s; echo '%s'\n", command, markerID)
-
-
-	// Write wrapped command to shell stdin
-	p.logger.Debug("Writing command to bash", zap.String("command", command), zap.String("markerID", markerID))
-	_, err := bashExec.Stdin.Write([]byte(wrappedCommand))
+// decodeParams decodes the request fields into a typed struct, reporting type mismatches
+func decodeParams(raw map[string]json.RawMessage, dst any) error {
+	b, err := json.Marshal(raw)
 	if err != nil {
-		p.logger.Error("Failed to write command to bash", zap.Error(err))
-		return p.writeErrorBuf(bufWriter, enc, fmt.Errorf("failed to write command: %w", err))
+		return err
 	}
-	p.logger.Debug("Command written to bash, waiting for output", zap.String("command", command))
-
-	// Read response from bash stdout and stderr
-	// We need to read until we get a prompt or timeout
-	// For simplicity, we'll read with a timeout and collect output
-	timeout := 60 * time.Second
-	if p.timeoutSeconds > 0 {
-		timeout = time.Duration(p.timeoutSeconds) * time.Second
-	}
-
-	stdoutChan := make(chan string, 1)
-	stderrChan := make(chan string, 1)
-	errChan := make(chan error, 2)
-
-	// Read stdout with timeout and marker detection
-	go func() {
-		buf := make([]byte, 4096)
-		var output strings.Builder
-		deadline := time.Now().Add(timeout)
-		markerFound := false
-
-		for time.Now().Before(deadline) && !markerFound {
-			// Use select with timeout for non-blocking read
-			readDone := make(chan bool, 1)
-			var n int
-			var readErr error
-
-			go func() {
-				n, readErr = bashExec.Stdout.Read(buf)
-				readDone <- true
-			}()
-
-			select {
-			case <-ctx.Done():
-				errChan <- ctx.Err()
-				return
-			case <-readDone:
-				if n > 0 {
-					output.Write(buf[:n])
-					// Check if marker is in the output
-					outputStr := output.String()
-					if strings.Contains(outputStr, markerID) {
-						markerFound = true
-						// Remove marker and everything after it from output
-						markerIdx := strings.Index(outputStr, markerID)
-						if markerIdx > 0 {
-							// Also remove the newline before marker if present
-							cleanOutput := outputStr[:markerIdx]
-							cleanOutput = strings.TrimSuffix(cleanOutput, "\n")
-							cleanOutput = strings.TrimSuffix(cleanOutput, "\r")
-							p.logger.Debug("Marker found in stdout", zap.String("command", command), zap.String("outputLength", fmt.Sprintf("%d", len(cleanOutput))))
-							stdoutChan <- cleanOutput
-						} else {
-							p.logger.Debug("Marker found but at start of output", zap.String("command", command))
-							stdoutChan <- ""
-						}
-						return
-					}
-				}
-				if readErr != nil {
-				if readErr == io.EOF {
-					// EOF before marker - command might have failed or shell closed
-					outputStr := output.String()
-					// Remove marker if somehow present
-					if strings.Contains(outputStr, markerID) {
-						markerIdx := strings.Index(outputStr, markerID)
-						if markerIdx > 0 {
-							outputStr = outputStr[:markerIdx]
-							outputStr = strings.TrimSuffix(outputStr, "\n")
-							outputStr = strings.TrimSuffix(outputStr, "\r")
-						}
-					}
-					p.logger.Warn("EOF received before marker found", zap.String("command", command), zap.String("outputLength", fmt.Sprintf("%d", len(outputStr))))
-					stdoutChan <- outputStr
-					return
-				}
-					errChan <- readErr
-					return
-				}
-			case <-time.After(500 * time.Millisecond):
-				// Check if we should continue or timeout
-				if time.Now().After(deadline) {
-					// Timeout - return what we have, removing marker if present
-					outputStr := output.String()
-					if strings.Contains(outputStr, markerID) {
-						markerIdx := strings.Index(outputStr, markerID)
-						if markerIdx > 0 {
-							outputStr = outputStr[:markerIdx]
-							outputStr = strings.TrimSuffix(outputStr, "\n")
-							outputStr = strings.TrimSuffix(outputStr, "\r")
-						}
-					}
-					p.logger.Warn("Timeout reading stdout, returning partial output", zap.String("command", command), zap.String("outputLength", fmt.Sprintf("%d", len(outputStr))))
-					stdoutChan <- outputStr
-					return
-				}
-			}
+	if err := json.Unmarshal(b, dst); err != nil {
+		var typeErr *json.UnmarshalTypeError
+		if errors.As(err, &typeErr) {
+			return fmt.Errorf("field '%s' must be of type %s", typeErr.Field, typeErr.Type)
 		}
-
-		// If we exit loop without finding marker, return what we have
-		if !markerFound {
-			outputStr := output.String()
-			if strings.Contains(outputStr, markerID) {
-				markerIdx := strings.Index(outputStr, markerID)
-				if markerIdx > 0 {
-					outputStr = outputStr[:markerIdx]
-					outputStr = strings.TrimSuffix(outputStr, "\n")
-					outputStr = strings.TrimSuffix(outputStr, "\r")
-				}
-			}
-			p.logger.Warn("Marker not found in stdout, returning partial output", zap.String("command", command), zap.String("outputLength", fmt.Sprintf("%d", len(outputStr))))
-			stdoutChan <- outputStr
-		}
-	}()
-
-	// Read stderr with timeout (marker won't be in stderr, but we still need to read it)
-	go func() {
-		buf := make([]byte, 4096)
-		var output strings.Builder
-		deadline := time.Now().Add(timeout)
-		lastReadTime := time.Now()
-
-		for time.Now().Before(deadline) {
-			readDone := make(chan bool, 1)
-			var n int
-			var readErr error
-
-			go func() {
-				n, readErr = bashExec.Stderr.Read(buf)
-				readDone <- true
-			}()
-
-			select {
-			case <-ctx.Done():
-				errChan <- ctx.Err()
-				return
-			case <-readDone:
-				if n > 0 {
-					output.Write(buf[:n])
-					lastReadTime = time.Now()
-				}
-				if readErr != nil {
-					if readErr == io.EOF {
-						stderrChan <- output.String()
-						return
-					}
-					errChan <- readErr
-					return
-				}
-			case <-time.After(500 * time.Millisecond):
-				if time.Now().After(deadline) {
-					stderrChan <- output.String()
-					return
-				}
-				// If we haven't read anything for a while and stdout found marker, we're done
-				if output.Len() > 0 && time.Since(lastReadTime) > 1*time.Second {
-					// Give a bit more time for stderr to complete
-					time.Sleep(300 * time.Millisecond)
-					stderrChan <- output.String()
-					return
-				}
-			}
-		}
-		stderrChan <- output.String()
-	}()
-
-	// Wait for output or timeout
-	var stdout, stderr string
-	select {
-	case <-ctx.Done():
-		p.logger.Warn("Context cancelled while waiting for command output", zap.String("command", command))
-		return p.writeErrorBuf(bufWriter, enc, ctx.Err())
-	case stdout = <-stdoutChan:
-		// Got stdout, marker was found
-		p.logger.Debug("Received stdout from command", zap.String("command", command), zap.String("stdoutLength", fmt.Sprintf("%d", len(stdout))))
-	case err := <-errChan:
-		p.logger.Error("Error reading stdout", zap.String("command", command), zap.Error(err))
-		return p.writeErrorBuf(bufWriter, enc, fmt.Errorf("failed to read stdout: %w", err))
-	case <-time.After(timeout):
-		// Timeout occurred - check if we got any output from goroutines
-		p.logger.Warn("Timeout waiting for command output", zap.String("command", command), zap.Duration("timeout", timeout))
-		select {
-		case stdout = <-stdoutChan:
-			p.logger.Debug("Received stdout after timeout", zap.String("command", command), zap.String("stdoutLength", fmt.Sprintf("%d", len(stdout))))
-		default:
-			// No output received, command might have completed without output
-			// This can happen for commands like 'cd' that don't produce output
-			p.logger.Debug("No stdout received, command may have no output", zap.String("command", command))
-			stdout = ""
-		}
+		return err
 	}
-
-	// Wait for stderr with shorter timeout since stdout is done
-	select {
-	case stderr = <-stderrChan:
-	case err := <-errChan:
-		// stderr read error is not critical
-		p.logger.Warn("Failed to read stderr", zap.Error(err))
-	case <-time.After(2 * time.Second):
-		// Give stderr a bit more time, but not too long
-		select {
-		case stderr = <-stderrChan:
-		default:
-			stderr = ""
-		}
-	}
-
-	// Try to determine exit code by checking if command succeeded
-	// This is a simplification - in real bash we'd need to check $?
-	exitCode := 0
-	if strings.Contains(stderr, "error") || strings.Contains(stderr, "Error") {
-		exitCode = 1
-	}
-
-	// Update last active
-	_ = p.updateLastActive(time.Now())
-
-	// Send response
-	p.logger.Debug("Preparing to send response", zap.String("command", command), zap.String("stdoutLength", fmt.Sprintf("%d", len(stdout))), zap.String("stderrLength", fmt.Sprintf("%d", len(stderr))), zap.Int("exitCode", exitCode))
-	resp := execResponse{Stdout: stdout, Stderr: stderr, ExitCode: exitCode}
-	
-	// Serialize response to JSON bytes
-	respBytes, err := json.Marshal(resp)
-	if err != nil {
-		p.logger.Error("Failed to marshal response", zap.String("command", command), zap.Error(err))
-		return fmt.Errorf("failed to marshal response: %w", err)
-	}
-	// Add newline to match json.Encoder behavior
-	respBytes = append(respBytes, '\n')
-	
-	// Write response directly to connection using conn.Write()
-	// This bypasses all buffers and writes directly to the socket
-	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	n, err := conn.Write(respBytes)
-	conn.SetWriteDeadline(time.Time{}) // Clear deadline
-	
-	if err != nil {
-		p.logger.Error("Failed to write response to connection", zap.String("command", command), zap.Error(err), zap.Int("bytesWritten", n), zap.Int("totalBytes", len(respBytes)))
-		return fmt.Errorf("failed to write response: %w", err)
-	}
-	
-	if n != len(respBytes) {
-		p.logger.Warn("Partial write to connection", zap.String("command", command), zap.Int("bytesWritten", n), zap.Int("totalBytes", len(respBytes)))
-	}
-	
-	p.logger.Info("Command executed and response sent successfully", zap.String("command", command), zap.String("stdoutLength", fmt.Sprintf("%d", len(stdout))), zap.Int("exitCode", exitCode), zap.Int("bytesWritten", n))
-
 	return nil
 }
 
-func (p *Proxy) exec(ctx context.Context, command string) (string, string, int, error) {
-	return p.execWithTimeout(ctx, command, p.timeoutSeconds)
-}
-
-func (p *Proxy) execWithTimeout(ctx context.Context, command string, timeoutSeconds int) (string, string, int, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	// ensure container exists and is running
-	containerID, err := p.ensureContainer(ctx)
-	if err != nil {
-		return "", "", -1, err
+func (p *Proxy) handleStart(req startRequest) any {
+	if req.Command == nil || *req.Command == "" {
+		return newProtocolError(errInvalidParams, "field 'command' is required")
 	}
 
-	// Wait for Docker daemon to be ready inside DinD container
+	lifetime := jobDefaultMaxLifetime
+	if req.MaxLifetime != nil {
+		if *req.MaxLifetime <= 0 {
+			return newProtocolError(errInvalidParams, "field 'max_lifetime' must be positive")
+		}
+		lifetime = min(*req.MaxLifetime, jobMaxLifetimeCap)
+	}
+
+	env, perr := envList(req.Env)
+	if perr != nil {
+		return perr
+	}
+
+	p.jobsMu.Lock()
+	parent := p.jobsCtx
+	p.jobsMu.Unlock()
+
+	j := newJob(parent, *req.Command, req.Cwd, env, jobOutputLimit)
+	if !p.registerJob(j) {
+		j.cancel()
+		return newProtocolError(errProxyBusy, "too many running jobs (limit %d)", p.maxJobs)
+	}
+	p.launchJob(j, time.Duration(lifetime)*time.Second)
+
+	p.logger.Info("job accepted", zap.String("jobID", j.id), zap.String("command", j.command), zap.Int("maxLifetime", lifetime))
+	return startResponse{JobID: j.id}
+}
+
+func envList(env map[string]string) ([]string, *protocolError) {
+	list := make([]string, 0, len(env))
+	for k, v := range env {
+		if k == "" || strings.ContainsAny(k, "=\x00") {
+			return nil, newProtocolError(errInvalidParams, "invalid environment variable name %q", k)
+		}
+		list = append(list, k+"="+v)
+	}
+	sort.Strings(list)
+	return list, nil
+}
+
+func (p *Proxy) handlePoll(ctx context.Context, req pollRequest, block bool) any {
+	if req.JobID == "" {
+		return newProtocolError(errInvalidParams, "field 'job_id' is required")
+	}
+	if req.StdoutOffset < 0 || req.StderrOffset < 0 {
+		return newProtocolError(errInvalidParams, "offsets must not be negative")
+	}
+	j := p.getJob(req.JobID)
+	if j == nil {
+		return newProtocolError(errJobNotFound, "Job %s not found", req.JobID)
+	}
+
+	if block {
+		timeout := jobDefaultWaitTimeout
+		if req.Timeout != nil {
+			timeout = max(0, min(*req.Timeout, jobWaitTimeoutCap))
+		}
+		select {
+		case <-j.done:
+		case <-time.After(time.Duration(timeout) * time.Second):
+		case <-ctx.Done():
+		}
+	}
+
+	_ = p.updateLastActive(time.Now())
+	return j.poll(req.StdoutOffset, req.StderrOffset)
+}
+
+func (p *Proxy) handleKill(ctx context.Context, req killRequest) any {
+	if req.JobID == "" {
+		return newProtocolError(errInvalidParams, "field 'job_id' is required")
+	}
+	signal := req.Signal
+	if signal == "" {
+		signal = "TERM"
+	}
+	if signal != "TERM" && signal != "KILL" {
+		return newProtocolError(errInvalidParams, "field 'signal' must be \"TERM\" or \"KILL\"")
+	}
+	j := p.getJob(req.JobID)
+	if j == nil {
+		return newProtocolError(errJobNotFound, "Job %s not found", req.JobID)
+	}
+
+	if exited, exitCode := j.state(); exited {
+		return killResponse{JobID: j.id, Status: "already_exited", ExitCode: &exitCode}
+	}
+
+	if !p.signalJob(ctx, j, signal) {
+		// the process was gone already: the job is finishing on its own
+		select {
+		case <-j.done:
+			_, exitCode := j.state()
+			return killResponse{JobID: j.id, Status: "already_exited", ExitCode: &exitCode}
+		case <-time.After(time.Second):
+		}
+	}
+
+	p.logger.Info("job killed", zap.String("jobID", j.id), zap.String("signal", signal))
+	return killResponse{JobID: j.id, Status: "killed"}
+}
+
+// exec runs a command synchronously. On timeout the command is killed and exit code 124 is returned.
+func (p *Proxy) exec(ctx context.Context, command string, timeoutSeconds int) (*execResponse, error) {
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = p.timeoutSeconds
+	}
+	timeoutSeconds = min(timeoutSeconds, execMaxTimeout)
+
+	p.jobsMu.Lock()
+	parent := p.jobsCtx
+	p.jobsMu.Unlock()
+
+	p.execs.Add(1)
+	defer p.execs.Add(-1)
+
+	j := newJob(parent, command, "", nil, execOutputLimit)
+	p.launchJob(j, 0)
+
+	timedOut := false
+	select {
+	case <-j.done:
+	case <-time.After(time.Duration(timeoutSeconds) * time.Second):
+		timedOut = true
+	case <-ctx.Done():
+		timedOut = true
+	}
+	if timedOut {
+		p.logger.Warn("Command execution timed out", zap.String("command", command), zap.Int("timeout", timeoutSeconds))
+		p.forceKill(j)
+		<-j.done
+	}
+
+	j.mu.Lock()
+	exitCode, infraErr := j.exitCode, j.infraErr
+	j.mu.Unlock()
+	if infraErr != nil {
+		return nil, infraErr
+	}
+
+	stdout, _, _ := j.stdout.read(0, true)
+	stderr, _, _ := j.stderr.read(0, true)
+	resp := &execResponse{Stdout: string(stdout), Stderr: string(stderr), ExitCode: exitCode}
+	if timedOut {
+		resp.Stderr += fmt.Sprintf("\n[Command timed out after %d seconds]", timeoutSeconds)
+		resp.ExitCode = 124
+	}
+	return resp, nil
+}
+
+// readyContainer returns a running container with a ready Docker daemon, creating it if needed
+func (p *Proxy) readyContainer(ctx context.Context) (string, error) {
+	p.mu.Lock()
+	containerID, err := p.ensureContainer(ctx)
+	p.mu.Unlock()
+	if err != nil {
+		return "", err
+	}
+
 	if err := p.waitForDockerDaemon(ctx, containerID); err != nil {
 		p.logger.Warn("Docker daemon might not be ready, continuing anyway", zap.Error(err))
 	}
-
-	// update last active
 	_ = p.updateLastActive(time.Now())
-
-	// Wrap command to prevent interactive input and ensure it doesn't hang
-	// Redirect stdin from /dev/null to prevent commands from waiting for input
-	// Use timeout command if available, otherwise just redirect stdin
-	wrappedCommand := fmt.Sprintf("%s </dev/null", command)
-
-	stdout, stderr, exitCode, err := p.dockerClient.ExecInContainer(ctx, containerID, []string{"sh", "-lc", wrappedCommand}, timeoutSeconds)
-	_ = p.updateLastActive(time.Now())
-
-	// Check if timeout occurred
-	if err != nil && strings.Contains(err.Error(), "timeout") {
-		p.logger.Warn("Command execution timed out", zap.String("command", command), zap.Int("timeout", timeoutSeconds))
-		return stdout, stderr + "\n[Command timed out after " + fmt.Sprintf("%d", timeoutSeconds) + " seconds]", 124, err
-	}
-
-	return stdout, stderr, exitCode, err
+	return containerID, nil
 }
 
 func (p *Proxy) status(ctx context.Context) (*statusResponse, error) {
@@ -661,7 +518,7 @@ func (p *Proxy) destroy(ctx context.Context) error {
 		_ = p.dockerClient.StopContainer(ctx, meta.ContainerID)
 		_ = p.dockerClient.RemoveContainer(ctx, meta.ContainerID)
 	}
-	_ = os.Remove(p.metaPath)
+	p.removeMeta()
 	return nil
 }
 
@@ -728,7 +585,10 @@ func (p *Proxy) ensureContainer(ctx context.Context) (string, error) {
 	}
 
 	meta = &proxyMeta{ContainerID: containerID, LastActiveAt: time.Now()}
-	if err := p.writeMeta(meta); err != nil {
+	p.metaMu.Lock()
+	err = p.writeMeta(meta)
+	p.metaMu.Unlock()
+	if err != nil {
 		p.logger.Error("failed to write meta", zap.Error(err))
 	} else {
 		p.logger.Info("Container meta saved", zap.String("containerID", containerID))
@@ -744,18 +604,18 @@ func (p *Proxy) waitForDockerDaemon(ctx context.Context, containerID string) err
 	defer ticker.Stop()
 
 	for {
+		// Try to run docker version command to check if daemon is ready
+		stdout, stderr, exitCode, err := p.dockerClient.ExecInContainer(ctx, containerID, []string{"sh", "-c", "docker version >/dev/null 2>&1"}, 5)
+		if err == nil && exitCode == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout waiting for Docker daemon: stdout=%s, stderr=%s, exitCode=%d", stdout, stderr, exitCode)
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			// Try to run docker version command to check if daemon is ready
-			stdout, stderr, exitCode, err := p.dockerClient.ExecInContainer(ctx, containerID, []string{"sh", "-c", "docker version >/dev/null 2>&1"}, 5)
-			if err == nil && exitCode == 0 {
-				return nil
-			}
-			if time.Now().After(deadline) {
-				return fmt.Errorf("timeout waiting for Docker daemon: stdout=%s, stderr=%s, exitCode=%d", stdout, stderr, exitCode)
-			}
 		}
 	}
 }
@@ -772,15 +632,29 @@ func (p *Proxy) readMeta() (*proxyMeta, error) {
 	return &m, nil
 }
 
+// writeMeta atomically replaces the meta file, so concurrent readers never see a partial write
 func (p *Proxy) writeMeta(m *proxyMeta) error {
 	b, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
-	return ioutil.WriteFile(p.metaPath, b, 0o644)
+	tmp := p.metaPath + ".tmp"
+	if err := ioutil.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, p.metaPath)
+}
+
+func (p *Proxy) removeMeta() {
+	p.metaMu.Lock()
+	defer p.metaMu.Unlock()
+	_ = os.Remove(p.metaPath)
 }
 
 func (p *Proxy) updateLastActive(t time.Time) error {
+	p.metaMu.Lock()
+	defer p.metaMu.Unlock()
+
 	meta, err := p.readMeta()
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -803,6 +677,13 @@ func (p *Proxy) lifecycleManager(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			p.collectJobs(time.Now())
+			if p.hasRunningJobs() {
+				// a background job may run silently for up to max_lifetime
+				_ = p.updateLastActive(time.Now())
+				continue
+			}
+
 			p.mu.Lock()
 			meta, err := p.readMeta()
 			if err != nil {
@@ -817,7 +698,7 @@ func (p *Proxy) lifecycleManager(ctx context.Context) {
 				p.logger.Info("removing container due to inactivity", zap.String("container", meta.ContainerID))
 				_ = p.dockerClient.StopContainer(ctx, meta.ContainerID)
 				_ = p.dockerClient.RemoveContainer(ctx, meta.ContainerID)
-				_ = os.Remove(p.metaPath)
+				p.removeMeta()
 				p.mu.Unlock()
 				continue
 			}

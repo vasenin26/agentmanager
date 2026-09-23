@@ -279,60 +279,60 @@ func (r *realDocker) ExecInContainer(ctx context.Context, id string, cmd []strin
 	return stdoutBuf.String(), stderrBuf.String(), exitCode, nil
 }
 
-func (r *realDocker) CreateLongRunningExec(ctx context.Context, id string, cmd []string) (*LongRunningExec, error) {
-	r.logger.Info("Create long-running exec in container", zap.String("containerID", id), zap.Strings("cmd", cmd))
+func (r *realDocker) ExecStream(ctx context.Context, id string, opts ExecStreamOptions) (int, error) {
+	r.logger.Info("Exec stream in container", zap.String("containerID", id), zap.Strings("cmd", opts.Cmd))
 
-	createOpts := docker.CreateExecOptions{
+	execObj, err := r.client.CreateExec(docker.CreateExecOptions{
 		Container:    id,
-		Cmd:          cmd,
-		AttachStdin:  true,
+		Cmd:          opts.Cmd,
+		Env:          opts.Env,
 		AttachStdout: true,
 		AttachStderr: true,
 		Tty:          false,
-	}
-
-	execObj, err := r.client.CreateExec(createOpts)
+		Context:      ctx,
+	})
 	if err != nil {
 		r.logger.Error("CreateExec failed", zap.String("containerID", id), zap.Error(err))
-		return nil, fmt.Errorf("create exec failed: %w", err)
+		return -1, fmt.Errorf("create exec failed: %w", err)
 	}
 
-	// Create pipes for stdin/stdout/stderr
-	stdinReader, stdinWriter := io.Pipe()
-	stdoutReader, stdoutWriter := io.Pipe()
-	stderrReader, stderrWriter := io.Pipe()
-
-	// Start the exec process with the pipes in a goroutine (StartExec blocks)
-	startOpts := docker.StartExecOptions{
-		InputStream:  stdinReader,
-		OutputStream: stdoutWriter,
-		ErrorStream:  stderrWriter,
+	cw, err := r.client.StartExecNonBlocking(execObj.ID, docker.StartExecOptions{
+		OutputStream: opts.Stdout,
+		ErrorStream:  opts.Stderr,
 		RawTerminal:  false,
+	})
+	if err != nil {
+		r.logger.Error("StartExec failed", zap.String("execID", execObj.ID), zap.Error(err))
+		return -1, fmt.Errorf("start exec failed: %w", err)
 	}
 
-	// Start exec in goroutine since it blocks until process completes
-	go func() {
-		err := r.client.StartExec(execObj.ID, startOpts)
-		if err != nil {
-			r.logger.Error("StartExec error in goroutine", zap.String("execID", execObj.ID), zap.Error(err))
-			// Close pipes on error
-			stdinReader.Close()
-			stdoutWriter.Close()
-			stderrWriter.Close()
-		} else {
-			// Close writer ends when exec completes
-			stdoutWriter.Close()
-			stderrWriter.Close()
-		}
-	}()
+	done := make(chan error, 1)
+	go func() { done <- cw.Wait() }()
 
-	r.logger.Info("Long-running exec started", zap.String("execID", execObj.ID))
-	return &LongRunningExec{
-		Stdin:  stdinWriter,
-		Stdout: stdoutReader,
-		Stderr: stderrReader,
-		ExecID: execObj.ID,
-	}, nil
+	select {
+	case err = <-done:
+	case <-ctx.Done():
+		_ = cw.Close()
+		<-done
+		return -1, ctx.Err()
+	}
+	if err != nil {
+		r.logger.Error("Exec stream error", zap.String("execID", execObj.ID), zap.Error(err))
+		return -1, fmt.Errorf("exec stream failed: %w", err)
+	}
+
+	// The stream closes when the process exits, but the daemon may need a moment to record the exit code
+	for i := 0; ; i++ {
+		inspect, err := r.client.InspectExec(execObj.ID)
+		if err != nil {
+			return -1, fmt.Errorf("inspect exec failed: %w", err)
+		}
+		if !inspect.Running || i >= 20 {
+			r.logger.Info("Exec stream finished", zap.String("execID", execObj.ID), zap.Int("exitCode", inspect.ExitCode))
+			return inspect.ExitCode, nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func (r *realDocker) ListRunnedContainers(ctx context.Context) ([]ContainerInspect, error) {

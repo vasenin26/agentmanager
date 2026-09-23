@@ -39,12 +39,12 @@ type DockerEvent struct {
 	ExitCode    int
 }
 
-// LongRunningExec represents a long-running exec process with stdin/stdout/stderr streams
-type LongRunningExec struct {
-	Stdin  io.WriteCloser
-	Stdout io.ReadCloser
-	Stderr io.ReadCloser
-	ExecID string
+// ExecStreamOptions describes an exec whose output is streamed into the given writers
+type ExecStreamOptions struct {
+	Cmd    []string
+	Env    []string  // Дополнительные переменные окружения в формате KEY=VALUE
+	Stdout io.Writer // Должен быть безопасен для конкурентной записи вместе со Stderr
+	Stderr io.Writer
 }
 
 type DockerClient interface {
@@ -54,8 +54,10 @@ type DockerClient interface {
 	RemoveContainer(ctx context.Context, id string) error
 	// ExecInContainer executes a command inside a container and returns stdout, stderr and exit code
 	ExecInContainer(ctx context.Context, id string, cmd []string, timeoutSeconds int) (string, string, int, error)
-	// CreateLongRunningExec creates a long-running exec process and returns stdin/stdout/stderr streams
-	CreateLongRunningExec(ctx context.Context, id string, cmd []string) (*LongRunningExec, error)
+	// ExecStream executes a command inside a container, streaming its output into opts writers.
+	// Blocks until the process exits (or ctx is cancelled — the stream is then detached,
+	// the process itself is not killed) and returns its exit code.
+	ExecStream(ctx context.Context, id string, opts ExecStreamOptions) (int, error)
 	StartContainer(ctx context.Context, id string) error
 	StopContainer(ctx context.Context, id string) error
 	ListRunnedContainers(ctx context.Context) ([]ContainerInspect, error)
